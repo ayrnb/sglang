@@ -52,6 +52,9 @@ __global__ void per_tensor_quant_fp8_kernel(
     const int64_t num_elements) {
   const int gid = blockIdx.x * blockDim.x + threadIdx.x;
   const int grid_size = blockDim.x * gridDim.x;
+#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  asm volatile("griddepcontrol.wait;");
+#endif
   const float scale_val = 1.0f / (*scale);
 
   // We want to store 128 bits of data at a time. 16 = 128 / 8 bits
@@ -91,6 +94,9 @@ __global__ void per_tensor_quant_fp8_kernel(
         c10::Float8_e4m3fnuz::from_bits());
 #endif
   }
+#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  asm volatile("griddepcontrol.launch_dependents;");
+#endif
 }
 
 void sgl_per_tensor_quant_fp8(torch::Tensor input, torch::Tensor output_q, torch::Tensor output_s, bool is_static) {
