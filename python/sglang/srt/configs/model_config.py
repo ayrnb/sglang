@@ -128,6 +128,7 @@ class ModelConfig:
             **kwargs,
         )
         self.hf_text_config = get_hf_text_config(self.hf_config)
+
         self.hf_generation_config = get_generation_config(
             self.model_path,
             trust_remote_code=trust_remote_code,
@@ -224,6 +225,19 @@ class ModelConfig:
         self.is_matryoshka = self.matryoshka_dimensions or getattr(
             self.hf_config, "is_matryoshka", False
         )
+
+        # Get num_n_gram for over encoding
+        self.num_n_gram = self._get_num_n_gram()
+
+    def _get_num_n_gram(self) -> int:
+        """Get the number of n-grams for over encoding.
+        
+        Initial inference from hf_config. For more complex models, 
+        this can be refined by model interfaces in the runtime.
+        """
+        # Default heuristic: check oe_grams in hf_config directly to avoid heavy imports
+        oe_grams = getattr(self.hf_config, "oe_grams", [])
+        return max(oe_grams) if oe_grams else 0
 
     @staticmethod
     def from_server_args(

@@ -52,6 +52,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPBuffer
 from sglang.srt.layers.moe.utils import get_deepep_mode, get_moe_a2a_backend
 from sglang.srt.layers.utils import MultiPlatformOp
+from sglang.srt.managers.schedule_batch import NGramInputIds
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -347,6 +348,18 @@ class CudaGraphRunner:
         )
 
         self.tbo_plugin = TboCudaGraphRunnerPlugin()
+
+        # Over Encoding
+        if self.model_runner.server_args.enable_over_encoding:
+            # num_n_gram is obtained from model'config (set during init or by model interface)
+            num_n_gram = getattr(self.model_runner.model_config, 'num_n_gram', 0)
+            if num_n_gram > 0:
+                self.input_ids_grams = [
+                    torch.zeros((self.max_num_token,), dtype=torch.int64, device=self.device)
+                    for _ in range(num_n_gram - 1)
+                ]
+            else:
+                self.input_ids_grams = []
 
         # Speculative_inference
         if (
@@ -671,6 +684,13 @@ class CudaGraphRunner:
             global_forward_mode=self.capture_forward_mode,
             lora_ids=lora_ids,
         )
+
+        # Over Encoding: set n_gram_input_ids for cuda graph capture
+        if self.model_runner.server_args.enable_over_encoding:
+            forward_batch.n_gram_input_ids = NGramInputIds(
+                input_ids_grams=[gram[:num_tokens] for gram in self.input_ids_grams]
+            )
+
         self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
 
         if lora_ids is not None:
@@ -803,6 +823,16 @@ class CudaGraphRunner:
             ),
             pp_proxy_tensors=pp_proxy_tensors,
         )
+
+        # Over Encoding: copy n_gram_input_ids
+        if (
+            self.model_runner.server_args.enable_over_encoding
+            and forward_batch.n_gram_input_ids is not None
+        ):
+            for i, gram in enumerate(forward_batch.n_gram_input_ids.input_ids_grams):
+                if i < len(self.input_ids_grams):
+                    self.input_ids_grams[i][:raw_num_token].copy_(gram)
+
         if self.enable_two_batch_overlap:
             self.tbo_plugin.replay_prepare(
                 forward_mode=self.capture_forward_mode,

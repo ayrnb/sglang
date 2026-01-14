@@ -92,6 +92,7 @@ class RadixAttention(nn.Module):
         self.pos_encoding_mode = pos_encoding_mode
         self.logit_capping_method = logit_capping_method
         self.xai_temperature_len = -1
+        self.is_kv_mirror = False
 
     def forward(
         self,
@@ -111,7 +112,7 @@ class RadixAttention(nn.Module):
             else:
                 k = k.view(-1, self.tp_k_head_num, self.v_head_dim)
 
-        if forward_batch.forward_mode.is_extend() and get_forward_context() is not None:
+        if forward_batch.forward_mode.is_extend() and get_forward_context() is not None and not self.is_kv_mirror:
             if self.qk_head_dim != self.v_head_dim:
                 output = q.new_empty((q.shape[0], self.tp_q_head_num * self.v_head_dim))
             else:

@@ -21,6 +21,7 @@ from sglang.srt.layers.amx_utils import PackWeightMethod
 from sglang.srt.layers.communicator import get_attn_tp_context
 from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
 from sglang.srt.layers.parameter import BasevLLMParameter
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
@@ -205,10 +206,12 @@ class VocabParallelEmbedding(torch.nn.Module):
         enable_tp: bool = True,
         use_attn_tp_group: bool = False,
         use_presharded_weights: bool = False,
+        enable_over_encoding: bool = False,
     ):
         super().__init__()
         self.quant_config = quant_config
 
+        self.enable_over_encoding = enable_over_encoding
         self.enable_tp = enable_tp
         if self.enable_tp:
             if use_attn_tp_group:
@@ -306,6 +309,9 @@ class VocabParallelEmbedding(torch.nn.Module):
             self.num_embeddings_padded,
             params_dtype=params_dtype,
             weight_loader=self.weight_loader,
+            host_tensor=True
+            if (self.__class__ is VocabParallelEmbedding and self.enable_over_encoding)
+            else False,
         )
 
     @classmethod
@@ -527,6 +533,7 @@ class ParallelLMHead(VocabParallelEmbedding):
         prefix: str = "",
         use_attn_tp_group: bool = False,
         use_presharded_weights: bool = False,
+        enable_over_encoding: bool = False,
     ):
         super().__init__(
             num_embeddings,
@@ -538,6 +545,7 @@ class ParallelLMHead(VocabParallelEmbedding):
             prefix=prefix,
             use_attn_tp_group=use_attn_tp_group,
             use_presharded_weights=use_presharded_weights,
+            enable_over_encoding=enable_over_encoding,
         )
         self.quant_config = quant_config
 

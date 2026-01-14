@@ -99,6 +99,52 @@ INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
 logger = logging.getLogger(__name__)
 
 
+@dataclasses.dataclass
+class NGramInputIds:
+    """N-gram input IDs for over encoding support.
+    
+    Supports configurable n-gram range. The n values (e.g., 2, 3, 4) are determined
+    by model config (num_n_gram). For CUDA graph compatibility, tensors are stored 
+    in a list with fixed length based on model's num_n_gram setting.
+    
+    Args:
+        input_ids_grams: List of tensors for n-gram input IDs.
+                         Index i corresponds to (i+2)-gram (i.e., index 0 = 2-gram).
+    """
+    input_ids_grams: List[torch.Tensor] = dataclasses.field(default_factory=list)
+
+    def __getitem__(self, idx):
+        return self.input_ids_grams[idx]
+
+    def get_gram(self, n: int) -> Optional[torch.Tensor]:
+        """Get the tensor for n-gram input IDs (n >= 2)."""
+        idx = n - 2
+        if 0 <= idx < len(self.input_ids_grams):
+            return self.input_ids_grams[idx]
+        return None
+    
+    def __getitem__(self, n: int) -> Optional[torch.Tensor]:
+        """Get the tensor for n-gram input IDs (n >= 2)."""
+        return self.get_gram(n)
+    
+    def __len__(self) -> int:
+        """Return the number of n-gram tensors."""
+        return len(self.input_ids_grams)
+    
+    # Backward compatibility properties
+    @property
+    def input_ids_gram2(self) -> Optional[torch.Tensor]:
+        return self.get_gram(2)
+    
+    @property
+    def input_ids_gram3(self) -> Optional[torch.Tensor]:
+        return self.get_gram(3)
+    
+    @property
+    def input_ids_gram4(self) -> Optional[torch.Tensor]:
+        return self.get_gram(4)
+
+
 class BaseFinishReason:
     def __init__(self, is_error: bool = False):
         self.is_error = is_error
@@ -1285,6 +1331,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Metrics
     dp_cooperation_info: Optional[DPCooperationInfo] = None
 
+    # For over encoding
+    n_gram_input_ids: Optional[NGramInputIds] = None
+
     @classmethod
     def init_new(
         cls,
@@ -1407,6 +1456,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             len(self.out_cache_loc) == self.extend_num_tokens
         ), f"Expected {len(self.out_cache_loc)}, got {self.extend_num_tokens}"
 
+    def _get_token_ids_gram_n(self, req_input_ids, n):
+        """Get n-gram shifted token ids for over encoding."""
+        seq_len = len(req_input_ids)
+        result_id = [0] * seq_len
+        if seq_len <= n:
+            return result_id
+        else:
+            result_id[n:] = req_input_ids[:-n]
+            return result_id
+
     def prepare_for_extend(self):
         self.forward_mode = ForwardMode.EXTEND
 
@@ -1439,6 +1498,28 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         input_ids_tensor = torch.tensor(
             list(chain.from_iterable(input_ids)), dtype=torch.int64
         ).to(self.device, non_blocking=True)
+
+        # Prepare n-gram input ids for over encoding
+        if get_global_server_args().enable_over_encoding:
+            # num_n_gram is obtained from model_config (set during init or by model interface)
+            num_n_gram = getattr(self.model_config, 'num_n_gram', 0)
+            if num_n_gram > 0:
+                input_ids_grams = [[] for _ in range(num_n_gram - 1)]  # index 0 = 2-gram, etc.
+                for r in reqs:
+                    prefix_len = len(r.prefix_indices)
+                    for i in range(num_n_gram - 1):
+                        n = i + 2  # n = 2, 3, 4, ...
+                        input_ids_grams[i].append(self._get_token_ids_gram_n(r.fill_ids, n - 1)[prefix_len:])
+
+                self.n_gram_input_ids = NGramInputIds(
+                    input_ids_grams=[
+                        torch.tensor(sum(gram_list, []), dtype=torch.int64).to(
+                            self.device, non_blocking=True
+                        )
+                        for gram_list in input_ids_grams
+                    ]
+                )
+
         seq_lens_tensor = torch.tensor(seq_lens, dtype=torch.int64).to(
             self.device, non_blocking=True
         )
@@ -1928,6 +2009,30 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.input_ids = self.output_ids
         self.output_ids = None
 
+        # Prepare n-gram input ids for over encoding
+        if get_global_server_args().enable_over_encoding:
+            # num_n_gram is obtained from model_config (set during init or by model interface)
+            num_n_gram = getattr(self.model_config, 'num_n_gram', 0)
+            if num_n_gram > 0:
+                input_ids_grams = [[] for _ in range(num_n_gram - 1)]
+                for r in self.reqs:
+                    for i in range(num_n_gram - 1):
+                        n = i + 2  # n = 2, 3, 4, ...
+                        if len(r.output_ids) >= n:
+                            val = r.output_ids[-n]
+                        elif len(r.output_ids) + len(r.origin_input_ids) >= n:
+                            val = r.origin_input_ids[-(n - len(r.output_ids))]
+                        else:
+                            val = 0
+                        input_ids_grams[i].append(val)
+
+                self.n_gram_input_ids = NGramInputIds(
+                    input_ids_grams=[
+                        torch.tensor(gram_list, dtype=torch.int64).to(self.device, non_blocking=True)
+                        for gram_list in input_ids_grams
+                    ]
+                )
+
         if self.model_config.is_encoder_decoder:
             self.prepare_encoder_info_decode()
 
@@ -2179,6 +2284,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             mamba_track_indices=self.mamba_track_indices,
             mamba_track_mask=self.mamba_track_mask,
             mamba_track_seqlens=self.mamba_track_seqlens,
+            n_gram_input_ids=self.n_gram_input_ids,
         )
 
     def copy(self):
@@ -2313,3 +2419,6 @@ class ModelWorkerBatch:
     mamba_track_indices: Optional[torch.Tensor] = None  # shape: [b], int64
     mamba_track_mask: Optional[torch.Tensor] = None  # shape: [b], bool
     mamba_track_seqlens: Optional[torch.Tensor] = None  # shape: [b], int64
+
+    # For over encoding
+    n_gram_input_ids: Optional[NGramInputIds] = None
