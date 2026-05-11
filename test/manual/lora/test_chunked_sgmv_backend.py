@@ -1,7 +1,7 @@
 import random
 import unittest
 from enum import Enum
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 
@@ -13,7 +13,6 @@ from sglang.srt.lora.triton_ops import (
 from sglang.srt.lora.triton_ops.chunked_sgmv_expand import _chunked_lora_expand_kernel
 from sglang.srt.lora.triton_ops.chunked_sgmv_shrink import _chunked_lora_shrink_kernel
 from sglang.srt.lora.utils import LoRABatchInfo
-from sglang.test.lora_utils import reference_sgmv_expand, reference_sgmv_shrink
 
 CHUNK_SIZE = 16
 
@@ -21,6 +20,12 @@ CHUNK_SIZE = 16
 def reset_kernel_cache():
     _chunked_lora_shrink_kernel._clear_cache()
     _chunked_lora_expand_kernel._clear_cache()
+
+
+def safe_matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """Matrix multiplication with mixed precision handling for float16"""
+    result = torch.matmul(a.float(), b.float())
+    return result.to(a.dtype)
 
 
 class BatchComposition(Enum):
@@ -33,7 +38,150 @@ class BatchComposition(Enum):
 class BatchMode(Enum):
     PREFILL = "prefill"
     DECODE = "decode"
-    TARGET_VERIFY = "verify"
+
+
+def reference_sgmv_shrink(
+    x: torch.Tensor,
+    weights: torch.Tensor,
+    batch_info: LoRABatchInfo,
+    seq_lengths: List[int],
+    lora_assignments: List[str],
+    num_slices: int = 1,
+) -> torch.Tensor:
+    """
+    Simple sequence-level reference implementation of SGMV shrink operation.
+
+    Args:
+        x: (total_seq_len, input_dim) - Input activations
+        weights: (num_loras, num_slices * max_rank, input_dim) - LoRA A weights
+        batch_info: Batch information (only used for lora_ranks)
+        seq_lengths: Length of each sequence
+        lora_assignments: LoRA name for each sequence
+        num_slices: Number of slices (3 for QKV, 2 for gate_up, 1 for others)
+
+    Returns:
+        output: (total_seq_len, num_slices * max_rank) - Intermediate activations
+    """
+    if weights.numel() == 0:
+        total_seq_len = x.shape[0]
+        return torch.zeros(total_seq_len, 0, dtype=x.dtype, device=x.device)
+
+    total_seq_len, input_dim = x.shape
+    num_loras, weight_out_dim, _ = weights.shape
+    max_rank = weight_out_dim // num_slices
+
+    output = torch.zeros(
+        total_seq_len, num_slices * max_rank, dtype=x.dtype, device=x.device
+    )
+
+    unique_loras = sorted(set(lora_assignments))
+    lora_name_to_idx = {name: idx for idx, name in enumerate(unique_loras)}
+    lora_ranks = batch_info.lora_ranks.cpu().numpy()
+
+    token_offset = 0
+    for seq_len, lora_name in zip(seq_lengths, lora_assignments):
+        if seq_len == 0:
+            continue
+
+        lora_idx = lora_name_to_idx[lora_name]
+        rank = lora_ranks[lora_idx]
+
+        if rank > 0:
+            x_seq = x[token_offset : token_offset + seq_len, :]
+            w_seq = weights[lora_idx, : num_slices * rank, :]
+
+            result = safe_matmul(x_seq, w_seq.t())
+            output[token_offset : token_offset + seq_len, : num_slices * rank] = result
+
+        token_offset += seq_len
+
+    return output
+
+
+def reference_sgmv_expand(
+    x: torch.Tensor,
+    weights: torch.Tensor,
+    batch_info: LoRABatchInfo,
+    seq_lengths: List[int],
+    lora_assignments: List[str],
+    slice_offsets: torch.Tensor,
+    max_slice_size: int,
+    base_output: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """
+    Simple sequence-level reference implementation of SGMV expand operation.
+
+    Args:
+        x: (total_seq_len, num_slices * max_rank) - Intermediate activations
+        weights: (num_loras, output_dim, max_rank) - LoRA B weights
+        batch_info: Batch information (only used for lora_ranks)
+        seq_lengths: Length of each sequence
+        lora_assignments: LoRA name for each sequence
+        slice_offsets: Tensor defining slice boundaries
+        max_slice_size: Maximum slice size for chunking
+        base_output: Optional base output to accumulate into
+
+    Returns:
+        output: (total_seq_len, total_output_dim) - Final output
+    """
+    if weights.numel() == 0:
+        total_seq_len = x.shape[0]
+        total_output_dim = slice_offsets[-1].item() if len(slice_offsets) > 0 else 0
+        return torch.zeros(
+            total_seq_len, total_output_dim, dtype=x.dtype, device=x.device
+        )
+
+    total_seq_len, _ = x.shape
+
+    num_slices = len(slice_offsets) - 1
+
+    if base_output is not None:
+        output = base_output.clone()
+    else:
+        total_output_dim = slice_offsets[-1].item()
+        output = torch.zeros(
+            total_seq_len, total_output_dim, dtype=x.dtype, device=x.device
+        )
+
+    unique_loras = sorted(set(lora_assignments))
+    lora_name_to_idx = {name: idx for idx, name in enumerate(unique_loras)}
+    lora_ranks = batch_info.lora_ranks.cpu().numpy()
+
+    token_offset = 0
+    for seq_len, lora_name in zip(seq_lengths, lora_assignments):
+        if seq_len == 0:
+            continue
+
+        lora_idx = lora_name_to_idx[lora_name]
+        lora_rank = lora_ranks[lora_idx]
+
+        if lora_rank > 0:
+            # Extract sequence intermediate activations
+            x_seq = x[
+                token_offset : token_offset + seq_len, : num_slices * lora_rank
+            ]  # (seq_len, num_slices * rank)
+
+            for slice_idx in range(num_slices):
+                slice_start_input = slice_idx * lora_rank
+                slice_end_input = (slice_idx + 1) * lora_rank
+
+                slice_start_output = slice_offsets[slice_idx].item()
+                slice_end_output = slice_offsets[slice_idx + 1].item()
+
+                x_slice = x_seq[:, slice_start_input:slice_end_input]  # (seq_len, rank)
+                w_slice = weights[
+                    lora_idx, slice_start_output:slice_end_output, :lora_rank
+                ]  # (slice_dim, rank)
+
+                result = safe_matmul(x_slice, w_slice.t())  # (seq_len, slice_dim)
+                output[
+                    token_offset : token_offset + seq_len,
+                    slice_start_output:slice_end_output,
+                ] += result
+
+        token_offset += seq_len
+
+    return output
 
 
 class TestChunkedSGMV(unittest.TestCase):
@@ -48,7 +196,7 @@ class TestChunkedSGMV(unittest.TestCase):
         chunked_output: torch.Tensor,
         reference_output: torch.Tensor,
         seq_lengths: List[int],
-        lora_assignments: List[int],
+        lora_assignments: List[str],
         batch_info: LoRABatchInfo,
         num_slices: int,
         test_name: str,
@@ -59,15 +207,19 @@ class TestChunkedSGMV(unittest.TestCase):
         The chunked SGMV shrink kernel only guarantees correctness for
         output[seq_start:seq_end, :rank * num_slices] for each sequence.
         """
+        # Create mapping from LoRA names to indices and ranks
+        unique_loras = sorted(set(lora_assignments))
+        lora_name_to_idx = {name: idx for idx, name in enumerate(unique_loras)}
         lora_ranks = batch_info.lora_ranks.cpu().numpy()
 
         token_offset = 0
-        for seq_idx, (lora_idx, seq_len) in enumerate(
-            zip(lora_assignments, seq_lengths)
+        for seq_idx, (seq_len, lora_name) in enumerate(
+            zip(seq_lengths, lora_assignments)
         ):
             if seq_len == 0:
                 continue
 
+            lora_idx = lora_name_to_idx[lora_name]
             rank = lora_ranks[lora_idx]
 
             if rank > 0:
@@ -86,7 +238,7 @@ class TestChunkedSGMV(unittest.TestCase):
                     reference_seq,
                     rtol=self.RTOL,
                     atol=self.ATOL,
-                    msg=f"Shrink operation failed for {test_name}, sequence {seq_idx} ({lora_idx})",
+                    msg=f"Shrink operation failed for {test_name}, sequence {seq_idx} ({lora_name})",
                 )
 
             token_offset += seq_len
@@ -166,22 +318,23 @@ class TestChunkedSGMV(unittest.TestCase):
 
     def create_batch_info(
         self,
-        lora_names: List[str],
         seq_lengths: List[int],
-        lora_assignments: List[Optional[int]],
+        lora_assignments: List[Optional[str]],
         batch_mode: BatchMode = BatchMode.PREFILL,
     ) -> LoRABatchInfo:
         """Create LoRABatchInfo using the same logic as chunked backend"""
-        lora_ranks = [self.lora_configs[name][0] for name in lora_names]
+        unique_loras = sorted(set(lora_assignments))
+        lora_name_to_idx = {name: idx for idx, name in enumerate(unique_loras)}
+
+        seq_weight_indices = [lora_name_to_idx[name] for name in lora_assignments]
+
+        lora_ranks = [self.lora_configs[name][0] for name in unique_loras]
 
         def create_mock_batch():
             # Create a minimal mock ForwardBatch for the test
             class MockForwardBatch:
-                def __init__(self, batch_size, seq_lengths, device):
+                def __init__(self, batch_size, seq_lengths):
                     self.batch_size = batch_size
-                    self.extend_seq_lens = torch.tensor(
-                        seq_lengths, dtype=torch.int32, device=device
-                    )
                     self.extend_seq_lens_cpu = seq_lengths
                     self.forward_mode = MockForwardMode()
 
@@ -189,22 +342,13 @@ class TestChunkedSGMV(unittest.TestCase):
                 def is_extend(self):
                     return batch_mode == BatchMode.PREFILL
 
-                def is_decode(self):
-                    return batch_mode == BatchMode.DECODE
-
-                def is_target_verify(self):
-                    return batch_mode == BatchMode.TARGET_VERIFY
-
-                def is_prefill(self):
-                    return self.is_extend()
-
-            return MockForwardBatch(len(seq_lengths), seq_lengths, self.device)
+            return MockForwardBatch(len(seq_lengths), seq_lengths)
 
         mock_batch = create_mock_batch()
 
         # Use the same functions as chunked backend
         permutation, weights_reordered = ChunkedSgmvLoRABackend._get_permutation(
-            lora_assignments, mock_batch
+            seq_weight_indices, mock_batch
         )
 
         # Create a minimal backend instance to access _get_segments_info
@@ -219,7 +363,7 @@ class TestChunkedSGMV(unittest.TestCase):
             chunk_size=CHUNK_SIZE,
         )
 
-        scalings = [1.0] * len(lora_names)
+        scalings = [1.0] * len(unique_loras)
         seg_indptr_tensor = seg_indptr.to(self.device)
         weight_indices_tensor = weight_indices_list.to(self.device)
         lora_ranks_tensor = (
@@ -293,7 +437,7 @@ class TestChunkedSGMV(unittest.TestCase):
         include_missing_k: bool = False,
     ) -> Tuple[
         torch.Tensor,
-        List[Tuple[torch.Tensor, torch.Tensor]],
+        Dict[str, Tuple[torch.Tensor, torch.Tensor]],
         LoRABatchInfo,
         List[int],
         List[str],
@@ -307,21 +451,20 @@ class TestChunkedSGMV(unittest.TestCase):
             batch_size, batch_mode, 1, self.max_seq_len
         )
         if batch_composition == BatchComposition.UNIFORM:
-            lora_names = ["lora_A"]
-            lora_assignments = [lora_names.index("lora_A")] * batch_size
+            lora_assignments = ["lora_A"] * batch_size
         elif batch_composition == BatchComposition.MIXED:
             lora_names = ["lora_A", "lora_B", "lora_C", None]
-            lora_assignments = [(i % len(lora_names)) for i in range(batch_size)]
+            lora_assignments = [
+                lora_names[i % len(lora_names)] for i in range(batch_size)
+            ]
         elif batch_composition == BatchComposition.SKEWED:
-            lora_names = ["lora_A", "lora_B"]
             num_minority = max(1, batch_size // 8)
-            lora_assignments = [lora_names.index("lora_A")] * num_minority + [
-                lora_names.index("lora_B")
-            ] * (batch_size - num_minority)
+            lora_assignments = ["lora_A"] * num_minority + ["lora_B"] * (
+                batch_size - num_minority
+            )
             random.shuffle(lora_assignments)
         elif batch_composition == BatchComposition.NONE:
-            lora_names = [None]
-            lora_assignments = [0] * batch_size
+            lora_assignments = [None] * batch_size
         else:
             raise ValueError(f"Unknown batch composition: {batch_composition}")
 
@@ -330,45 +473,39 @@ class TestChunkedSGMV(unittest.TestCase):
             total_seq_len, self.input_dim, dtype=self.dtype, device=self.device
         )
 
-        normalized_lora_names = [
-            "_NO_LORA_" if name is None else name for name in lora_names
+        normalized_assignments = [
+            name if name is not None else "_NO_LORA_" for name in lora_assignments
         ]
-        weights = []
-        for lora_name in normalized_lora_names:
-            weights.append(self.create_lora_weights(lora_name, include_missing_k))
+        unique_loras = set(normalized_assignments)
+        weights = {}
+        for lora_name in unique_loras:
+            weights[lora_name] = self.create_lora_weights(lora_name, include_missing_k)
 
         batch_info = self.create_batch_info(
-            normalized_lora_names, seq_lengths, lora_assignments, batch_mode
+            seq_lengths, normalized_assignments, batch_mode
         )
 
-        return x, weights, batch_info, seq_lengths, lora_assignments
+        return x, weights, batch_info, seq_lengths, normalized_assignments
 
     def run_test_comparison(
         self,
         x: torch.Tensor,
-        weights: List[Tuple[torch.Tensor, torch.Tensor]],
+        weights: Dict[str, Tuple[torch.Tensor, torch.Tensor]],
         batch_info: LoRABatchInfo,
         seq_lengths: List[int],
-        lora_assignments: List[int],
+        lora_assignments: List[str],
         test_name: str,
     ):
         """Run comparison between chunked and reference implementations"""
         if not weights:  # Handle case with no LoRA weights
             return
 
-        lora_assignments_tensor = torch.tensor(
-            lora_assignments, dtype=torch.int32, device="cpu"
-        )
-        seq_lengths_tensor = torch.tensor(seq_lengths, dtype=torch.int32, device="cpu")
-        lora_ranks_tensor = batch_info.lora_ranks.detach().cpu()
-        scalings_tensor = batch_info.scalings.detach().cpu()
-
         # Stack LoRA A weights
-        lora_a_weights = [weight[0] for weight in weights]
+        lora_a_weights = [weights[name][0] for name in sorted(weights.keys())]
         stacked_lora_a = self.stack_lora_weights(lora_a_weights, is_lora_a=True)
 
         # Stack LoRA B weights
-        lora_b_weights = [weight[1] for weight in weights]
+        lora_b_weights = [weights[name][1] for name in sorted(weights.keys())]
         stacked_lora_b = self.stack_lora_weights(lora_b_weights, is_lora_a=False)
 
         # Test shrink operation
@@ -376,13 +513,7 @@ class TestChunkedSGMV(unittest.TestCase):
             x, stacked_lora_a, batch_info, num_slices=3
         )
         reference_shrink = reference_sgmv_shrink(
-            x,
-            stacked_lora_a,
-            lora_assignments_tensor,
-            seq_lengths_tensor,
-            lora_ranks_tensor,
-            scalings_tensor,
-            num_slices=3,
+            x, stacked_lora_a, batch_info, seq_lengths, lora_assignments, num_slices=3
         )
 
         # Only compare valid portions of shrink output (first rank * num_slices columns per sequence)
@@ -408,10 +539,11 @@ class TestChunkedSGMV(unittest.TestCase):
         reference_expand = reference_sgmv_expand(
             reference_shrink,
             stacked_lora_b,
-            lora_assignments_tensor,
-            seq_lengths_tensor,
-            lora_ranks_tensor,
+            batch_info,
+            seq_lengths,
+            lora_assignments,
             self.slice_offsets,
+            self.max_slice_size,
         )
 
         torch.testing.assert_close(
@@ -432,16 +564,7 @@ class TestChunkedSGMV(unittest.TestCase):
                     self.create_test_batch(BatchComposition.UNIFORM, batch_size)
                 )
 
-                lora_assignments_tensor = torch.tensor(
-                    lora_assignments, dtype=torch.int32, device="cpu"
-                )
-                seq_lengths_tensor = torch.tensor(
-                    seq_lengths, dtype=torch.int32, device="cpu"
-                )
-                lora_ranks_tensor = batch_info.lora_ranks.detach().cpu()
-                scalings_tensor = batch_info.scalings.detach().cpu()
-
-                lora_a_weights = [weight[0] for weight in weights]
+                lora_a_weights = [weights[name][0] for name in sorted(weights.keys())]
                 stacked_lora_a = self.stack_lora_weights(lora_a_weights, is_lora_a=True)
 
                 chunked_shrink = chunked_sgmv_lora_shrink_forward(
@@ -450,10 +573,9 @@ class TestChunkedSGMV(unittest.TestCase):
                 reference_shrink = reference_sgmv_shrink(
                     x,
                     stacked_lora_a,
-                    lora_assignments_tensor,
-                    seq_lengths_tensor,
-                    lora_ranks_tensor,
-                    scalings_tensor,
+                    batch_info,
+                    seq_lengths,
+                    lora_assignments,
                     num_slices=3,
                 )
 
@@ -469,29 +591,19 @@ class TestChunkedSGMV(unittest.TestCase):
                     self.create_test_batch(BatchComposition.UNIFORM, batch_size)
                 )
 
-                lora_assignments_tensor = torch.tensor(
-                    lora_assignments, dtype=torch.int32, device="cpu"
-                )
-                seq_lengths_tensor = torch.tensor(
-                    seq_lengths, dtype=torch.int32, device="cpu"
-                )
-                lora_ranks_tensor = batch_info.lora_ranks.detach().cpu()
-                scalings_tensor = batch_info.scalings.detach().cpu()
-
-                lora_a_weights = [weight[0] for weight in weights]
+                lora_a_weights = [weights[name][0] for name in sorted(weights.keys())]
                 stacked_lora_a = self.stack_lora_weights(lora_a_weights, is_lora_a=True)
 
                 intermediate = reference_sgmv_shrink(
                     x,
                     stacked_lora_a,
-                    lora_assignments_tensor,
-                    seq_lengths_tensor,
-                    lora_ranks_tensor,
-                    scalings_tensor,
+                    batch_info,
+                    seq_lengths,
+                    lora_assignments,
                     num_slices=3,
                 )
 
-                lora_b_weights = [weight[1] for weight in weights]
+                lora_b_weights = [weights[name][1] for name in sorted(weights.keys())]
                 stacked_lora_b = self.stack_lora_weights(
                     lora_b_weights, is_lora_a=False
                 )
@@ -507,10 +619,11 @@ class TestChunkedSGMV(unittest.TestCase):
                 reference_expand = reference_sgmv_expand(
                     intermediate,
                     stacked_lora_b,
-                    lora_assignments_tensor,
-                    seq_lengths_tensor,
-                    lora_ranks_tensor,
+                    batch_info,
+                    seq_lengths,
+                    lora_assignments,
                     self.slice_offsets,
+                    self.max_slice_size,
                 )
 
                 torch.testing.assert_close(

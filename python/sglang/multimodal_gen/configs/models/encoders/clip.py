@@ -9,7 +9,6 @@ from sglang.multimodal_gen.configs.models.encoders.base import (
     TextEncoderArchConfig,
     TextEncoderConfig,
 )
-from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 
 
 def _is_transformer_layer(n: str, m) -> bool:
@@ -39,11 +38,6 @@ class CLIPTextArchConfig(TextEncoderArchConfig):
     bos_token_id: int = 49406
     eos_token_id: int = 49407
     text_len: int = 77
-    _supported_attention_backends: set[AttentionBackendEnum] = field(
-        default_factory=lambda: {
-            AttentionBackendEnum.TORCH_SDPA,  # Force TORCH_SDPA to support attention_mask
-        }
-    )
     stacked_params_mapping: list[tuple[str, str, str]] = field(
         default_factory=lambda: [
             # (param_name, shard_name, shard_id)

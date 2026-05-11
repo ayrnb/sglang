@@ -211,7 +211,6 @@ def process_tracing_init(otlp_endpoint, server_name):
     global tracing_enabled
     global __get_cur_time_ns
     if not opentelemetry_imported:
-        logger.warning(f"Tracing is disabled because the packages cannot be imported.")
         tracing_enabled = False
         return
 
@@ -240,9 +239,8 @@ def process_tracing_init(otlp_endpoint, server_name):
         tracer_provider.add_span_processor(processor)
         trace.set_tracer_provider(tracer_provider)
     except Exception as e:
-        logger.error(
-            f"Initialize OpenTelemetry error: {e}. Please set correct otlp endpoint."
-        )
+        logger.error(f": initialize opentelemetry error:{e}")
+        logger.warning("pelease set correct otlp endpoint")
         tracing_enabled = False
         return
 
@@ -465,7 +463,7 @@ def trace_req_start(
     if str(bootstrap_room) not in remote_trace_contexts:
         attrs = {"bootstrap_room": str(hex(bootstrap_room))}
         external_trace_context = _trace_context_propagator.extract(
-            external_trace_header or {}
+            external_trace_header
         )
         bootstrap_room_span = tracer.start_span(
             name=f"Bootstrap Room {hex(bootstrap_room)}",
@@ -536,7 +534,7 @@ def trace_req_finish(
     req_context.root_span.end(end_time=ts)
     if str(req_context.bootstrap_room) in remote_trace_contexts:
         del remote_trace_contexts[str(req_context.bootstrap_room)]
-    elif req_context.bootstrap_room_span:
+    else:
         req_context.bootstrap_room_span.end(end_time=ts)
 
     del reqs_context[rid]

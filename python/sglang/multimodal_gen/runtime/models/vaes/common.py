@@ -12,7 +12,6 @@ import torch
 import torch.distributed as dist
 from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
 from diffusers.utils.torch_utils import randn_tensor
-from torch import nn
 
 from sglang.multimodal_gen.configs.models import VAEConfig
 from sglang.multimodal_gen.runtime.distributed import (
@@ -21,7 +20,7 @@ from sglang.multimodal_gen.runtime.distributed import (
 )
 
 
-class ParallelTiledVAE(ABC, nn.Module):
+class ParallelTiledVAE(ABC):
     tile_sample_min_height: int
     tile_sample_min_width: int
     tile_sample_min_num_frames: int
@@ -34,7 +33,6 @@ class ParallelTiledVAE(ABC, nn.Module):
     use_parallel_tiling: bool
 
     def __init__(self, config: VAEConfig, **kwargs) -> None:
-        super().__init__()
         self.config = config
         self.tile_sample_min_height = config.tile_sample_min_height
         self.tile_sample_min_width = config.tile_sample_min_width
@@ -46,6 +44,10 @@ class ParallelTiledVAE(ABC, nn.Module):
         self.use_tiling = config.use_tiling
         self.use_temporal_tiling = config.use_temporal_tiling
         self.use_parallel_tiling = config.use_parallel_tiling
+
+    def to(self, device) -> "ParallelTiledVAE":
+        # TODO: implement this
+        return self
 
     @property
     def device(self):

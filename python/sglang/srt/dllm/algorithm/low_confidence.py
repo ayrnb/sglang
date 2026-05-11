@@ -5,20 +5,12 @@ import torch
 import torch.nn.functional as F
 
 from sglang.srt.dllm.algorithm.base import DllmAlgorithm
-from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
 
 
 class LowConfidence(DllmAlgorithm):
-
-    def __init__(
-        self,
-        config: DllmConfig,
-    ):
-        super().__init__(config)
-        self.threshold = config.algorithm_config.get("threshold", 0.95)
 
     def run(
         self,
@@ -35,8 +27,9 @@ class LowConfidence(DllmAlgorithm):
             if torch.sum(mask_index).item() == 0:
                 break
 
-            out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
-            logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
+            logits_output, can_run_cuda_graph = model_runner.forward(
+                forward_batch, pp_proxy_tensors=None
+            )
 
             x = torch.argmax(logits_output.full_logits, dim=-1)
             p = torch.squeeze(
@@ -49,16 +42,15 @@ class LowConfidence(DllmAlgorithm):
             )
             x = torch.where(mask_index, x, forward_batch.input_ids)
             confidence = torch.where(mask_index, p, -np.inf)
-
-            transfer_index = confidence > self.threshold
-            if transfer_index.sum().item() == 0:
-                _, select_index = torch.topk(confidence, k=1)
-                transfer_index[select_index] = True
+            transfer_index = torch.zeros_like(x, dtype=torch.bool, device=x.device)
+            _, select_index = torch.topk(confidence, k=1)
+            transfer_index[select_index] = True
 
             forward_batch.input_ids[transfer_index] = x[transfer_index]
 
-        out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
-        logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
+        logits_output, can_run_cuda_graph = model_runner.forward(
+            forward_batch, pp_proxy_tensors=None
+        )
 
         next_token_ids = forward_batch.input_ids[start:]
         return logits_output, next_token_ids, can_run_cuda_graph

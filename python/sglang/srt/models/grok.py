@@ -141,8 +141,8 @@ class Grok1MoE(nn.Module):
 
         self.topk = TopK(
             top_k=top_k,
+            layer_id=self.layer_id,
             renormalize=False,
-            layer_id=layer_id,
             custom_routing_function=custom_routing_function,
         )
 

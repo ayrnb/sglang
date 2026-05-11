@@ -132,13 +132,13 @@ class ScheduleBatchDisaggregationDecodeMixin:
 
         # Simulate the eagle run.
         if self.spec_algorithm.is_eagle():
-            num_states = server_args.speculative_eagle_topk
-            if server_args.enable_multi_layer_eagle:
-                num_states *= server_args.speculative_num_steps
+
+            b = len(self.reqs)
+            topk = server_args.speculative_eagle_topk
             topk_p = torch.stack(
                 [
                     torch.as_tensor(
-                        req.output_topk_p[:num_states],
+                        req.output_topk_p[:topk],
                         device=self.device,
                         dtype=torch.float32,
                     )
@@ -149,7 +149,7 @@ class ScheduleBatchDisaggregationDecodeMixin:
             topk_index = torch.stack(
                 [
                     torch.as_tensor(
-                        req.output_topk_index[:num_states],
+                        req.output_topk_index[:topk],
                         device=self.device,
                         dtype=torch.int64,
                     )

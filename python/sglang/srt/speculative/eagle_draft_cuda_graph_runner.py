@@ -33,6 +33,8 @@ from sglang.srt.utils import (
 if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_worker import EAGLEWorker
 
+from sglang.srt.managers.schedule_batch import NGramInputIds
+
 
 class EAGLEDraftCudaGraphRunner:
     def __init__(self, eagle_worker: EAGLEWorker):
@@ -88,8 +90,7 @@ class EAGLEDraftCudaGraphRunner:
             self.input_ids = torch.zeros((self.max_num_token,), dtype=torch.int64)
             self.req_pool_indices = torch.zeros((self.max_bs,), dtype=torch.int32)
             self.out_cache_loc = torch.zeros(
-                (self.max_num_token * self.speculative_num_steps,),
-                dtype=self._cache_loc_dtype(),
+                (self.max_num_token * self.speculative_num_steps,), dtype=torch.int64
             )
             self.positions = torch.zeros((self.max_num_token,), dtype=torch.int64)
             self.mrope_positions = torch.zeros(
@@ -105,7 +106,18 @@ class EAGLEDraftCudaGraphRunner:
                 (self.max_bs, self.model_runner.model_config.hidden_size),
                 dtype=self.model_runner.dtype,
             )
-
+            if self.model_runner.server_args.prepare_n_gram_inputs:
+                self.ngram_input_ids = NGramInputIds(
+                    input_ids_grams=[
+                        torch.zeros((self.max_num_token,), dtype=torch.int64)
+                        for _ in range(3)
+                    ],
+                    input_ids_buffer=torch.zeros(
+                        (self.max_bs * NGramInputIds.buffer_size), dtype=torch.int64
+                    ),
+                )
+            else:
+                self.ngram_input_ids = None
             if self.require_gathered_buffer:
                 if self.require_mlp_tp_gather:
                     self.global_num_tokens_gpu = torch.zeros(
@@ -133,15 +145,11 @@ class EAGLEDraftCudaGraphRunner:
                 f"Capture cuda graph failed: {e}\n{CUDA_GRAPH_CAPTURE_FAILED_MSG}"
             )
 
-    def _cache_loc_dtype(self):
-        return torch.int64
-
     def can_run(self, forward_batch: ForwardBatch):
         if self.require_mlp_tp_gather:
             cuda_graph_bs = (
                 max(forward_batch.global_num_tokens_cpu) // self.num_tokens_per_bs
                 if self.model_runner.spec_algorithm.is_eagle()
-                or self.model_runner.spec_algorithm.is_standalone()
                 else max(forward_batch.global_num_tokens_cpu)
             )
         else:
@@ -197,6 +205,18 @@ class EAGLEDraftCudaGraphRunner:
         hidden_states = self.hidden_states[:num_seqs]
         topk_p = self.topk_p[:num_seqs]
         topk_index = self.topk_index[:num_seqs]
+        if self.ngram_input_ids is not None:
+            buffer = self.ngram_input_ids.input_ids_buffer[
+                : num_seqs * self.ngram_input_ids.buffer_size
+            ]
+            current_ngram_input_ids = NGramInputIds(
+                input_ids_grams=[
+                    gram[:num_tokens] for gram in self.ngram_input_ids.input_ids_grams
+                ],
+                input_ids_buffer=buffer,
+            )
+        else:
+            current_ngram_input_ids = None
 
         if self.require_mlp_tp_gather:
             self.global_num_tokens_gpu.copy_(
@@ -272,6 +292,7 @@ class EAGLEDraftCudaGraphRunner:
             capture_hidden_mode=(
                 spec_info.capture_hidden_mode if spec_info else CaptureHiddenMode.NULL
             ),
+            n_gram_input_ids=current_ngram_input_ids,
         )
 
         # Attention backend
@@ -329,7 +350,6 @@ class EAGLEDraftCudaGraphRunner:
             max_batch_size = (
                 max_num_tokens // self.num_tokens_per_bs
                 if self.model_runner.spec_algorithm.is_eagle()
-                or self.model_runner.spec_algorithm.is_standalone()
                 else max_num_tokens
             )
             index = bisect.bisect_left(self.capture_bs, max_batch_size)
@@ -354,6 +374,15 @@ class EAGLEDraftCudaGraphRunner:
         self.topk_index[:raw_bs].copy_(forward_batch.spec_info.topk_index)
         self.hidden_states[:raw_bs].copy_(forward_batch.spec_info.hidden_states)
         self.req_pool_indices[:raw_bs].copy_(forward_batch.req_pool_indices)
+        if self.ngram_input_ids is not None:
+            self.ngram_input_ids.input_ids_buffer[
+                : raw_bs * NGramInputIds.buffer_size
+            ].copy_(forward_batch.n_gram_input_ids.input_ids_buffer)
+            for buf_gram, src_gram in zip(
+                self.ngram_input_ids.input_ids_grams,
+                forward_batch.n_gram_input_ids.input_ids_grams,
+            ):
+                buf_gram[:raw_num_token].copy_(src_gram)
 
         # TODO(ch-wan): support num_token_non_padded
         if self.require_gathered_buffer:

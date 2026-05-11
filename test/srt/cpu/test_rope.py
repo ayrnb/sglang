@@ -88,7 +88,6 @@ class TestROPE(CustomTestCase):
             rotary_dim: int,
             max_position_embeddings: int,
             base: int,
-            dims: int,
             is_neox_style: bool,
             dtype: torch.dtype,
             device: str,
@@ -120,9 +119,7 @@ class TestROPE(CustomTestCase):
                 dtype=dtype,
                 device=device,
             )
-            if dims == 4:
-                query = query.view(batch_size, seq_len, num_q_heads, head_size)
-                key = key.view(batch_size, seq_len, num_kv_heads, head_size)
+
             query_ref, key_ref = query.clone(), key.clone()
             query_cpu, key_cpu = query.clone(), key.clone()
 
@@ -164,21 +161,19 @@ class TestROPE(CustomTestCase):
             num_q_heads,
             num_kv_heads,
         ) in test_config:
-            for dim in [2, 4]:
-                single_test(
-                    head_size,
-                    rotary_dim,
-                    max_position_embeddings,
-                    base,
-                    dim,
-                    is_neox_style,
-                    dtype,
-                    device,
-                    batch_size,
-                    seq_len,
-                    num_q_heads,
-                    num_kv_heads,
-                )
+            single_test(
+                head_size,
+                rotary_dim,
+                max_position_embeddings,
+                base,
+                is_neox_style,
+                dtype,
+                device,
+                batch_size,
+                seq_len,
+                num_q_heads,
+                num_kv_heads,
+            )
 
 
 if __name__ == "__main__":

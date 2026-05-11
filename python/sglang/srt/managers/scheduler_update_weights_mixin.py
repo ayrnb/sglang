@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import traceback
 from typing import TYPE_CHECKING, Tuple
 
@@ -12,6 +13,8 @@ from sglang.srt.constants import (
     GPU_MEMORY_TYPE_KV_CACHE,
     GPU_MEMORY_TYPE_WEIGHTS,
 )
+from sglang.srt.distributed import get_moe_ep_group, get_moe_tp_group, get_tp_group
+from sglang.srt.layers.dp_attention import get_attention_tp_group
 from sglang.srt.managers.io_struct import (
     CheckWeightsReqInput,
     CheckWeightsReqOutput,
@@ -43,9 +46,7 @@ logger = logging.getLogger(__name__)
 
 class SchedulerUpdateWeightsMixin:
 
-    def update_weights_from_disk(
-        self: Scheduler, recv_req: UpdateWeightFromDiskReqInput
-    ):
+    def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
         """In-place update of the weights from disk."""
         success, message = self.tp_worker.update_weights_from_disk(recv_req)
         if success:
@@ -56,16 +57,12 @@ class SchedulerUpdateWeightsMixin:
             logger.error(message)
         return UpdateWeightFromDiskReqOutput(success, message, 0)
 
-    def init_weights_update_group(
-        self: Scheduler, recv_req: InitWeightsUpdateGroupReqInput
-    ):
+    def init_weights_update_group(self, recv_req: InitWeightsUpdateGroupReqInput):
         """Initialize the online model parameter update group."""
         success, message = self.tp_worker.init_weights_update_group(recv_req)
         return InitWeightsUpdateGroupReqOutput(success, message)
 
-    def destroy_weights_update_group(
-        self: Scheduler, recv_req: DestroyWeightsUpdateGroupReqInput
-    ):
+    def destroy_weights_update_group(self, recv_req: DestroyWeightsUpdateGroupReqInput):
         """Destroy the online model parameter update group."""
         success, message = self.tp_worker.destroy_weights_update_group(recv_req)
         return DestroyWeightsUpdateGroupReqOutput(success, message)
@@ -84,9 +81,7 @@ class SchedulerUpdateWeightsMixin:
             logger.error(message)
         return UpdateWeightsFromDistributedReqOutput(success, message)
 
-    def update_weights_from_tensor(
-        self: Scheduler, recv_req: UpdateWeightsFromTensorReqInput
-    ):
+    def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
         """Update the online model parameter from tensors."""
         worker = self.draft_worker or self.tp_worker
         success, message = worker.update_weights_from_tensor(recv_req)
@@ -100,9 +95,7 @@ class SchedulerUpdateWeightsMixin:
         torch.distributed.barrier(group=self.tp_cpu_group)
         return UpdateWeightsFromTensorReqOutput(success, message)
 
-    def update_weights_from_ipc(
-        self: Scheduler, recv_req: UpdateWeightsFromIPCReqInput
-    ):
+    def update_weights_from_ipc(self, recv_req: UpdateWeightsFromIPCReqInput):
         """Update the online model parameter from IPC for checkpoint-engine integration."""
         success, message = self.tp_worker.update_weights_from_ipc(recv_req)
         if success:
@@ -114,7 +107,7 @@ class SchedulerUpdateWeightsMixin:
         torch.distributed.barrier(group=self.tp_cpu_group)
         return UpdateWeightsFromIPCReqOutput(success, message)
 
-    def get_weights_by_name(self: Scheduler, recv_req: GetWeightsByNameReqInput):
+    def get_weights_by_name(self, recv_req: GetWeightsByNameReqInput):
         parameter = self.tp_worker.get_weights_by_name(recv_req)
         return GetWeightsByNameReqOutput(parameter)
 
@@ -147,6 +140,20 @@ class SchedulerUpdateWeightsMixin:
         if GPU_MEMORY_TYPE_CUDA_GRAPH in tags:
             self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_CUDA_GRAPH)
 
+            if os.environ.get("AMEM_ENABLE", "0") == "1":
+                tp_group = get_tp_group()
+                if tp_group is not None and tp_group.pynccl_comm is not None:
+                    tp_group.pynccl_comm.nccl_pause()
+                attn_tp_group = get_attention_tp_group()
+                if attn_tp_group is not None and attn_tp_group.pynccl_comm is not None:
+                    attn_tp_group.pynccl_comm.nccl_pause()
+                moe_ep_group = get_moe_ep_group()
+                if moe_ep_group is not None and moe_ep_group.pynccl_comm is not None:
+                    moe_ep_group.pynccl_comm.nccl_pause()
+                moe_tp_group = get_moe_tp_group()
+                if moe_tp_group is not None and moe_tp_group.pynccl_comm is not None:
+                    moe_tp_group.pynccl_comm.nccl_pause()
+
         torch.get_device_module().synchronize()
 
         return ReleaseMemoryOccupationReqOutput()
@@ -164,6 +171,20 @@ class SchedulerUpdateWeightsMixin:
 
         if GPU_MEMORY_TYPE_CUDA_GRAPH in tags:
             self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_CUDA_GRAPH)
+
+            if os.environ.get("AMEM_ENABLE", "0") == "1":
+                tp_group = get_tp_group()
+                if tp_group is not None and tp_group.pynccl_comm is not None:
+                    tp_group.pynccl_comm.nccl_resume()
+                attn_tp_group = get_attention_tp_group()
+                if attn_tp_group is not None and attn_tp_group.pynccl_comm is not None:
+                    attn_tp_group.pynccl_comm.nccl_resume()
+                moe_ep_group = get_moe_ep_group()
+                if moe_ep_group is not None and moe_ep_group.pynccl_comm is not None:
+                    moe_ep_group.pynccl_comm.nccl_resume()
+                moe_tp_group = get_moe_tp_group()
+                if moe_tp_group is not None and moe_tp_group.pynccl_comm is not None:
+                    moe_tp_group.pynccl_comm.nccl_resume()
 
         if GPU_MEMORY_TYPE_WEIGHTS in tags:
             self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_WEIGHTS)

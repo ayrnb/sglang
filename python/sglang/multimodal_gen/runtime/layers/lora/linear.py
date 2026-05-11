@@ -51,26 +51,13 @@ class BaseLayerWithLoRA(nn.Module):
         self.cpu_weight = base_layer.weight.to("cpu")
         # indicates adapter weights don't contain this layer
         # (which shouldn't normally happen, but we want to separate it from the case of erroneous merging)
-        # Default to True to prevent using uninitialized weights; set to False when weights are loaded
-        self.disable_lora: bool = True
+        self.disable_lora: bool = False
         self.lora_rank = lora_rank
         self.lora_alpha = lora_alpha
-        self.lora_weights_list: list[
-            tuple[torch.nn.Parameter, torch.nn.Parameter, str | None, float]
-        ] = []
         self.lora_path: str | None = None
-        self.strength: float = 1.0
 
         self.lora_A = None
         self.lora_B = None
-
-    @property
-    def weight(self):
-        return self.base_layer.weight
-
-    @property
-    def bias(self):
-        return getattr(self.base_layer, "bias", None)
 
     @torch.compile()
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -80,7 +67,6 @@ class BaseLayerWithLoRA(nn.Module):
             lora_B = self.lora_B.to_local()
             lora_A = self.lora_A.to_local()
 
-        # TODO: Support multiple LoRA adapters when use not merged mode
         if not self.merged and not self.disable_lora:
             lora_A_sliced = self.slice_lora_a_weights(lora_A.to(x, non_blocking=True))
             lora_B_sliced = self.slice_lora_b_weights(lora_B.to(x, non_blocking=True))
@@ -89,12 +75,11 @@ class BaseLayerWithLoRA(nn.Module):
                 delta = delta * (
                     self.lora_alpha / self.lora_rank  # type: ignore
                 )  # type: ignore
-            delta = delta * self.strength
             out, output_bias = self.base_layer(x)
             return out + delta, output_bias
         else:
             out, output_bias = self.base_layer(x)
-            return out, output_bias
+            return out.to(x), output_bias
 
     def slice_lora_a_weights(self, A: torch.Tensor) -> torch.Tensor:
         return A
@@ -107,91 +92,25 @@ class BaseLayerWithLoRA(nn.Module):
         A: torch.Tensor,
         B: torch.Tensor,
         lora_path: str | None = None,
-        strength: float = 1.0,
-        clear_existing: bool = False,
     ) -> None:
-        """
-        Set LoRA weights. Supports multiple LoRA adapters.
-
-        Args:
-            A: LoRA A weight tensor
-            B: LoRA B weight tensor
-            lora_path: Path to the LoRA adapter (for logging)
-            strength: LoRA strength
-            clear_existing: If True, clear existing LoRA weights before adding new one.
-                          If False, append to existing list (for multi-LoRA support).
-        """
-        lora_A_param = torch.nn.Parameter(
+        self.lora_A = torch.nn.Parameter(
             A
         )  # share storage with weights in the pipeline
-        lora_B_param = torch.nn.Parameter(B)
-
-        if clear_existing:
-            self.lora_weights_list.clear()
-            # Also clear backward compatibility attributes
-            self.lora_A = None
-            self.lora_B = None
-            self.lora_path = None
-            self.strength = 1.0
-
-        # Add to list for multi-LoRA support
-        self.lora_weights_list.append((lora_A_param, lora_B_param, lora_path, strength))
-
-        # Set backward compatibility attributes to point to the last LoRA (for single LoRA case)
-        # This ensures backward compatibility while supporting multiple LoRA
-        self.lora_A = lora_A_param
-        self.lora_B = lora_B_param
-        self.lora_path = lora_path
-        self.strength = strength
-
+        self.lora_B = torch.nn.Parameter(B)
         self.disable_lora = False
         self.merge_lora_weights()
+        self.lora_path = lora_path
 
     @torch.no_grad()
-    def _merge_lora_into_data(
-        self,
-        data: torch.Tensor,
-        lora_list: list[
-            tuple[torch.nn.Parameter, torch.nn.Parameter, str | None, float]
-        ],
-    ) -> None:
-        """
-        Merge all LoRA adapters into the data tensor in-place.
-
-        Args:
-            data: The base weight tensor to merge LoRA into (modified in-place)
-            lora_list: List of (lora_A, lora_B, lora_path, lora_strength) tuples
-        """
-        # Merge all LoRA adapters in order
-        for lora_A, lora_B, _, lora_strength in lora_list:
-            lora_delta = self.slice_lora_b_weights(
-                lora_B.to(data)
-            ) @ self.slice_lora_a_weights(lora_A.to(data))
-            # Apply lora_alpha / lora_rank scaling for consistency with forward()
-            if self.lora_alpha is not None and self.lora_rank is not None:
-                if self.lora_alpha != self.lora_rank:
-                    lora_delta = lora_delta * (self.lora_alpha / self.lora_rank)
-            data += lora_strength * lora_delta
-
-    @torch.no_grad()
-    def merge_lora_weights(self, strength: float | None = None) -> None:
-        if strength is not None:
-            self.strength = strength
-
+    def merge_lora_weights(self) -> None:
         if self.disable_lora:
             return
 
         if self.merged:
             self.unmerge_lora_weights()
-
-        # Use lora_weights_list if available, otherwise fall back to single LoRA for backward compatibility
-        lora_list = self.lora_weights_list if self.lora_weights_list else []
-        if not lora_list and self.lora_A is not None and self.lora_B is not None:
-            lora_list = [(self.lora_A, self.lora_B, self.lora_path, self.strength)]
-
-        if not lora_list:
-            raise ValueError("LoRA weights not set. Please set them first.")
-
+        assert (
+            self.lora_A is not None and self.lora_B is not None
+        ), "LoRA weights not set. Please set them first."
         if isinstance(self.base_layer.weight, DTensor):
             mesh = self.base_layer.weight.data.device_mesh
             unsharded_base_layer = ReplicatedLinear(
@@ -208,9 +127,9 @@ class BaseLayerWithLoRA(nn.Module):
             data = self.base_layer.weight.data.to(
                 get_local_torch_device()
             ).full_tensor()
-
-            self._merge_lora_into_data(data, lora_list)
-
+            data += self.slice_lora_b_weights(self.lora_B).to(
+                data
+            ) @ self.slice_lora_a_weights(self.lora_A).to(data)
             unsharded_base_layer.weight = nn.Parameter(data.to(current_device))
             if isinstance(getattr(self.base_layer, "bias", None), DTensor):
                 unsharded_base_layer.bias = nn.Parameter(
@@ -233,9 +152,9 @@ class BaseLayerWithLoRA(nn.Module):
         else:
             current_device = self.base_layer.weight.data.device
             data = self.base_layer.weight.data.to(get_local_torch_device())
-
-            self._merge_lora_into_data(data, lora_list)
-
+            data += self.slice_lora_b_weights(
+                self.lora_B.to(data)
+            ) @ self.slice_lora_a_weights(self.lora_A.to(data))
             self.base_layer.weight.data = data.to(current_device, non_blocking=True)
 
         self.merged = True
@@ -254,19 +173,13 @@ class BaseLayerWithLoRA(nn.Module):
         # avoid precision loss
         if isinstance(self.base_layer.weight, DTensor):
             device = self.base_layer.weight.data.device
-            old_weight = self.base_layer.weight
-            new_weight_data = self.cpu_weight.to(device, non_blocking=True)
-            self.base_layer.weight = nn.Parameter(new_weight_data)
-            del old_weight
+            self.base_layer.weight = nn.Parameter(
+                self.cpu_weight.to(device, non_blocking=True)
+            )
         else:
-            current_device = self.base_layer.weight.data.device
-            cpu_weight_on_device = self.cpu_weight.to(current_device, non_blocking=True)
-            self.base_layer.weight.data.copy_(cpu_weight_on_device)
-            if (
-                cpu_weight_on_device.data_ptr()
-                != self.base_layer.weight.data.data_ptr()
-            ):
-                del cpu_weight_on_device
+            self.base_layer.weight.data = self.cpu_weight.data.to(
+                self.base_layer.weight, non_blocking=True
+            )
 
         self.merged = False
 
@@ -406,6 +319,9 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
             self.base_layer, input_parallel
         )
 
+        if self.set_lora:
+            output_parallel = self.apply_lora(output_parallel, input_parallel)
+
         if self.base_layer.reduce_results and self.base_layer.tp_size > 1:
             output_ = tensor_model_parallel_all_reduce(output_parallel)
         else:
@@ -458,7 +374,6 @@ class LinearWithLoRA(BaseLayerWithLoRA):
             lora_B = self.lora_B.to_local()
             lora_A = self.lora_A.to_local()
 
-        # TODO: Support multiple LoRA adapters when use not merged mode
         if not self.merged and not self.disable_lora:
             lora_A_sliced = self.slice_lora_a_weights(lora_A.to(x, non_blocking=True))
             lora_B_sliced = self.slice_lora_b_weights(lora_B.to(x, non_blocking=True))
@@ -467,7 +382,6 @@ class LinearWithLoRA(BaseLayerWithLoRA):
                 delta = delta * (
                     self.lora_alpha / self.lora_rank  # type: ignore
                 )  # type: ignore
-            delta = delta * self.strength
             # nn.Linear.forward() returns a single tensor, not a tuple
             out = self.base_layer(x)
             return out + delta

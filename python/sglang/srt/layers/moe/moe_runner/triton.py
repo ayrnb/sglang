@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
+import torch.nn.functional as F
 import triton.language as tl
 
 from sglang.srt.layers.moe.moe_runner.base import (
@@ -19,7 +20,13 @@ from sglang.srt.layers.moe.moe_runner.base import (
     register_pre_permute,
 )
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
-from sglang.srt.utils import cpu_has_amx_support, is_cpu, is_cuda, is_hip
+from sglang.srt.utils import (
+    cpu_has_amx_support,
+    get_bool_env_var,
+    is_cpu,
+    is_cuda,
+    is_hip,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher.standard import (
@@ -32,25 +39,23 @@ _is_hip = is_hip()
 _is_cuda = is_cuda()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
-_use_aiter = bool(int(os.getenv("SGLANG_USE_AITER", "0")))
+_use_aiter = bool(int(os.getenv("SGLANG_MOE_USE_AITER", "0")))
 _MOE_PADDING_SIZE = 128 if bool(int(os.getenv("SGLANG_MOE_PADDING", "0"))) else 0
 
 
-if _is_cuda or _is_hip:
+if _is_cuda:
     from sgl_kernel import gelu_and_mul, silu_and_mul
-
-    if _is_hip:
-        if _use_aiter:
-            try:
-                from aiter import moe_sum
-            except ImportError:
-                raise ImportError(
-                    "aiter is required when SGLANG_USE_AITER is set to True"
-                )
-        else:
-            from vllm import _custom_ops as vllm_ops  # moe_sum
 elif _is_cpu and _is_cpu_amx_available:
     pass
+elif _is_hip:
+    from vllm import _custom_ops as vllm_ops  # gelu_and_mul, silu_and_mul
+
+    if _use_aiter:
+        try:
+            from aiter import moe_sum
+        except ImportError:
+            raise ImportError("aiter is required when SGLANG_USE_AITER is set to True")
+
 
 if _is_cuda or _is_hip:
     from sgl_kernel import (  # noqa: F401
@@ -117,7 +122,10 @@ class TritonRunnerCore(MoeRunnerCore):
 
         # TODO: move these functions to the triton runner
         from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
+            apply_routed_weight_to_cache,
             invoke_fused_moe_kernel,
+            mmq_sequential_moe_sum,
+            mmq_swiglu_mul_routed_weight,
             moe_sum_reduce_torch_compile,
             moe_sum_reduce_triton,
             swiglu_with_alpha_and_limit,
@@ -152,19 +160,25 @@ class TritonRunnerCore(MoeRunnerCore):
         inplace = self.config.inplace
         gemm1_alpha = self.config.gemm1_alpha
         gemm1_limit = self.config.gemm1_clamp_limit
+        swiglu_clamp_limit = self.config.swiglu_clamp_limit
         routed_scaling_factor = self.config.routed_scaling_factor
         apply_router_weight_on_input = self.config.apply_router_weight_on_input
+        apply_router_weight_on_swiglu = self.config.apply_router_weight_on_swiglu
 
         assert self.config.is_gated, "Only gated MoEs are supported for Triton runner"
+        assert not (
+            apply_router_weight_on_input and apply_router_weight_on_swiglu
+        ), "Cannot apply router weights both on MoE input and SwiGLU output"
 
         M = hidden_states.shape[0]
         E, N, _ = w13.shape
+        topk = topk_ids.shape[1]
         compute_type = (
             tl.bfloat16 if hidden_states.dtype == torch.bfloat16 else tl.float16
         )
 
         intermediate_cache1 = torch.empty(
-            (M, topk_ids.shape[1], N),
+            (M, topk, N),
             device=hidden_states.device,
             dtype=hidden_states.dtype,
         )
@@ -193,22 +207,43 @@ class TritonRunnerCore(MoeRunnerCore):
             per_channel_quant=per_channel_quant,
             block_shape=block_shape,
         )
-
         intermediate_cache2 = torch.empty(
-            (M * topk_ids.shape[1], N // 2),
+            (M * topk, N // 2),
             device=hidden_states.device,
             dtype=hidden_states.dtype,
         )
 
+        fused_router_weight_on_swiglu = False
         if activation == "silu":
-            if gemm1_alpha is not None:
+            if (
+                apply_router_weight_on_swiglu
+                and swiglu_clamp_limit is None
+                and gemm1_alpha is None
+                and _is_cuda
+            ):
+                mmq_swiglu_mul_routed_weight(
+                    intermediate_cache1.view(-1, N),
+                    intermediate_cache2,
+                    topk_weights,
+                    sorted_token_ids,
+                    num_tokens_post_padded,
+                    False,
+                    True,
+                )
+                fused_router_weight_on_swiglu = True
+            elif swiglu_clamp_limit is not None and swiglu_clamp_limit > 0:
+                cache_view = intermediate_cache1.view(-1, N)
+                gate = F.silu(cache_view[:, :N // 2]).clamp_(max=swiglu_clamp_limit)
+                up = cache_view[:, N // 2:].clamp(min=-swiglu_clamp_limit, max=swiglu_clamp_limit)
+                intermediate_cache2 = gate * up
+            elif gemm1_alpha is not None:
                 assert gemm1_limit is not None
                 intermediate_cache2 = swiglu_with_alpha_and_limit(
                     intermediate_cache1.view(-1, N),
                     gemm1_alpha,
                     gemm1_limit,
                 )
-            elif _is_cuda or _is_hip:
+            elif _is_cuda:
                 silu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
             else:
                 vllm_ops.silu_and_mul(
@@ -217,7 +252,7 @@ class TritonRunnerCore(MoeRunnerCore):
         elif activation == "gelu":
             assert gemm1_alpha is None, "gemm1_alpha is not supported for gelu"
             assert gemm1_limit is None, "gemm1_limit is not supported for gelu"
-            if _is_cuda or _is_hip:
+            if _is_cuda:
                 gelu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
             else:
                 vllm_ops.gelu_and_mul(
@@ -226,8 +261,16 @@ class TritonRunnerCore(MoeRunnerCore):
         else:
             raise ValueError(f"Unsupported activation: {activation=}")
 
+        if apply_router_weight_on_swiglu and not fused_router_weight_on_swiglu:
+            apply_routed_weight_to_cache(
+                intermediate_cache2,
+                topk_weights,
+                sorted_token_ids,
+                num_tokens_post_padded,
+                False,
+            )
         intermediate_cache3 = torch.empty(
-            (M, topk_ids.shape[1], w2.shape[1]),
+            (M, topk, w2.shape[1]),
             device=hidden_states.device,
             dtype=hidden_states.dtype,
         )
@@ -261,7 +304,7 @@ class TritonRunnerCore(MoeRunnerCore):
             sorted_token_ids,
             expert_ids,
             num_tokens_post_padded,
-            not apply_router_weight_on_input,
+            not apply_router_weight_on_input and not apply_router_weight_on_swiglu,
             1,
             running_state["config"],
             compute_type=compute_type,
@@ -272,15 +315,23 @@ class TritonRunnerCore(MoeRunnerCore):
             per_channel_quant=per_channel_quant,
             block_shape=block_shape,
         )
-
         if routed_scaling_factor is None:
             routed_scaling_factor = 1.0
 
+        use_mmq_moe_combine = apply_router_weight_on_swiglu and get_bool_env_var(
+            "SGLANG_WELMV4_MMQ_MOE_COMBINE", "false"
+        )
         if no_combine:
             pass
         elif _is_cuda:
             if topk_ids.shape[1] == 1 and routed_scaling_factor == 1.0:
                 pass  # we write directly into out_hidden_states
+            elif use_mmq_moe_combine:
+                mmq_sequential_moe_sum(
+                    intermediate_cache3,
+                    out_hidden_states,
+                    routed_scaling_factor,
+                )
             elif topk_ids.shape[1] == 2 and routed_scaling_factor == 1.0:
                 torch.add(
                     intermediate_cache3[:, 0],

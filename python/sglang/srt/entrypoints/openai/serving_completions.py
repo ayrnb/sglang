@@ -116,12 +116,10 @@ class OpenAIServingCompletion(OpenAIServingBase):
             bootstrap_host=request.bootstrap_host,
             bootstrap_port=request.bootstrap_port,
             bootstrap_room=request.bootstrap_room,
-            data_parallel_rank=request.data_parallel_rank,
             return_hidden_states=request.return_hidden_states,
             rid=request.rid,
             extra_key=self._compute_extra_key(request),
             priority=request.priority,
-            routing_key=self.extract_routing_key(raw_request),
             custom_labels=custom_labels,
             custom_logit_processor=request.custom_logit_processor,
         )
@@ -153,7 +151,6 @@ class OpenAIServingCompletion(OpenAIServingBase):
             "skip_special_tokens": request.skip_special_tokens,
             "logit_bias": request.logit_bias,
             "custom_params": request.custom_params,
-            "sampling_seed": request.seed,
         }
 
         # Handle response_format constraints
@@ -197,6 +194,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
         # State tracking for streaming
         stream_buffers = {}
         n_prev_tokens = {}
+        prompt_token_ids_cache = {}  # Cache prompt token ids per index
 
         # Usage tracking
         prompt_tokens = {}
@@ -223,6 +221,12 @@ class OpenAIServingCompletion(OpenAIServingBase):
                         echo_text = self._get_echo_text(request, index)
                         text = echo_text + text
 
+                    # Get prompt token ids for the first chunk if requested
+                    if request.return_token_ids and index not in prompt_token_ids_cache:
+                        prompt_token_ids_cache[index] = self._get_prompt_token_ids(
+                            request, content, index
+                        )
+
                 # Handle logprobs
                 logprobs = None
                 if request.logprobs is not None:
@@ -243,9 +247,9 @@ class OpenAIServingCompletion(OpenAIServingBase):
                         output_token_logprobs=content["meta_info"][
                             "output_token_logprobs"
                         ][n_prev_token:],
-                        output_top_logprobs=content["meta_info"].get(
-                            "output_top_logprobs", []
-                        )[n_prev_token:],
+                        output_top_logprobs=content["meta_info"]["output_top_logprobs"][
+                            n_prev_token:
+                        ],
                     )
                     n_prev_tokens[index] = len(
                         content["meta_info"]["output_token_logprobs"]
@@ -255,6 +259,11 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 delta = text[len(stream_buffer) :]
                 stream_buffers[index] = stream_buffer + delta
                 finish_reason = content["meta_info"]["finish_reason"]
+
+                # Include prompt_token_ids for all chunks
+                prompt_token_ids = None
+                if request.return_token_ids:
+                    prompt_token_ids = prompt_token_ids_cache.get(index)
 
                 choice_data = CompletionResponseStreamChoice(
                     index=index,
@@ -266,6 +275,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
                         if finish_reason and "matched" in finish_reason
                         else None
                     ),
+                    prompt_token_ids=prompt_token_ids,
                 )
                 chunk = CompletionStreamResponse(
                     id=content["meta_info"]["id"],
@@ -399,17 +409,23 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 logprobs = to_openai_style_logprobs(
                     input_token_logprobs=input_token_logprobs,
                     input_top_logprobs=input_top_logprobs,
-                    output_token_logprobs=ret_item["meta_info"].get(
-                        "output_token_logprobs", []
-                    ),
-                    output_top_logprobs=ret_item["meta_info"].get(
-                        "output_top_logprobs", []
-                    ),
+                    output_token_logprobs=ret_item["meta_info"][
+                        "output_token_logprobs"
+                    ],
+                    output_top_logprobs=ret_item["meta_info"]["output_top_logprobs"],
                 )
 
             # Handle hidden states
             hidden_states = process_hidden_states_from_ret(ret_item, request)
 
+            # Handle prompt token ids
+            prompt_token_ids = None
+            if request.return_token_ids:
+                prompt_token_ids = self._get_prompt_token_ids(request, ret_item, idx)
+                if prompt_token_ids is None:
+                    logger.warning(
+                        f"Failed to get prompt token ids for request {ret_item['meta_info'].get('id', 'unknown')}"
+                    )
             finish_reason = ret_item["meta_info"]["finish_reason"]
 
             choice_data = CompletionResponseChoice(
@@ -423,6 +439,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
                     else None
                 ),
                 hidden_states=hidden_states,
+                prompt_token_ids=prompt_token_ids,
             )
             choices.append(choice_data)
 
@@ -489,3 +506,41 @@ class OpenAIServingCompletion(OpenAIServingBase):
         else:
             # for the case of single str prompt
             return [request.prompt]
+
+    def _get_prompt_token_ids(
+        self, request: CompletionRequest, ret_item: Dict[str, Any], index: int
+    ) -> Optional[List[int]]:
+        """Get prompt token ids for a given request and result item"""
+        # Get the original prompt (before template processing)
+        prompt = request.prompt
+
+        # If prompt is already token ids, use it directly
+        if isinstance(prompt, list):
+            if isinstance(prompt[0], int):
+                # Single token ids prompt
+                return prompt
+            elif isinstance(prompt[0], list) and isinstance(prompt[0][0], int):
+                # Multiple token ids prompts
+                prompt_index = index // request.n if request.n > 1 else 0
+                if prompt_index < len(prompt):
+                    return prompt[prompt_index]
+
+        # For string prompts, we need to tokenize
+        # First, check if we need to apply template
+
+        if self.template_manager.completion_template_name is not None:
+            prompt = generate_completion_prompt_from_request(request)
+
+        # Tokenize the prompt
+        if isinstance(prompt, str):
+            # Single string prompt
+            encoded = self.tokenizer_manager.tokenizer(prompt)
+            return encoded["input_ids"]
+        elif isinstance(prompt, list) and isinstance(prompt[0], str):
+            # Multiple string prompts
+            prompt_index = index // request.n if request.n > 1 else 0
+            if prompt_index < len(prompt):
+                encoded = self.tokenizer_manager.tokenizer(prompt[prompt_index])
+                return encoded["input_ids"]
+
+        return None

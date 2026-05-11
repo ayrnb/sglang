@@ -49,7 +49,7 @@ class _RemovableDispatcherHandle:
             del hooks_dict[self.id]
 
 
-class DispatcherBaseHooks:
+class _DispatcherBaseHooks:
 
     def __init__(self):
         self.hook_dict = OrderedDict[int, Callable]()
@@ -63,7 +63,7 @@ class DispatcherBaseHooks:
         raise NotImplementedError("This method should be overridden by subclasses")
 
 
-class _PreDispatchHooks(DispatcherBaseHooks):
+class _PreDispatchHooks(_DispatcherBaseHooks):
 
     def __call__(
         self,
@@ -78,7 +78,7 @@ class _PreDispatchHooks(DispatcherBaseHooks):
         return hidden_states, topk_output
 
 
-class _PostDispatchHooks(DispatcherBaseHooks):
+class _PostDispatchHooks(_DispatcherBaseHooks):
 
     def __call__(
         self, dispatcher: BaseDispatcher, dispatch_output: DispatchOutput
@@ -90,7 +90,7 @@ class _PostDispatchHooks(DispatcherBaseHooks):
         return dispatch_output
 
 
-class _PreCombineHooks(DispatcherBaseHooks):
+class _PreCombineHooks(_DispatcherBaseHooks):
 
     def __call__(
         self, dispatcher: BaseDispatcher, combine_input: CombineInput
@@ -102,7 +102,7 @@ class _PreCombineHooks(DispatcherBaseHooks):
         return combine_input
 
 
-class _PostCombineHooks(DispatcherBaseHooks):
+class _PostCombineHooks(_DispatcherBaseHooks):
 
     def __call__(
         self, dispatcher: BaseDispatcher, hidden_states: torch.Tensor

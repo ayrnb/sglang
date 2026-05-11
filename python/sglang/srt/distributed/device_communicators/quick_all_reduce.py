@@ -10,7 +10,7 @@ import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
-import sglang.srt.distributed.device_communicators.custom_all_reduce_ops as ops
+from sglang.srt import _custom_ops as ops
 from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import (
     is_full_nvlink,
     is_weak_contiguous,
@@ -22,6 +22,14 @@ logger = logging.getLogger(__name__)
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
+
+
+try:
+    ops.qr_max_size()
+    quick_ar = True
+except Exception:
+    # For CPUs and CUDA
+    quick_ar = False
 
 
 @cache
@@ -93,7 +101,7 @@ class QuickAllReduce:
             )
             return
 
-        if not ops.IS_QUICK_AR_AVAILABLE:
+        if not quick_ar:
             # disable because of missing quick reduce library
             # e.g. in a cuda environment
             logger.info(

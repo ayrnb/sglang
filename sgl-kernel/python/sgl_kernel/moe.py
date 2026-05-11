@@ -267,7 +267,6 @@ def fused_qk_norm_rope(
     low: float,
     high: float,
     attention_factor: float,
-    rotary_dim: Optional[int] = None,
 ) -> None:
     torch.ops.sgl_kernel.fused_qk_norm_rope(
         qkv,
@@ -285,7 +284,6 @@ def fused_qk_norm_rope(
         low,
         high,
         attention_factor,
-        rotary_dim if rotary_dim is not None else head_dim,
     )
 
 

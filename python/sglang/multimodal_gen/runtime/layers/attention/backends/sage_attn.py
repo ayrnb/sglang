@@ -2,7 +2,6 @@
 
 # SPDX-License-Identifier: Apache-2.0
 
-
 import torch
 from sageattention import sageattn
 
@@ -11,13 +10,13 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
     AttentionImpl,
     AttentionMetadata,
 )
-from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 
 
 class SageAttentionBackend(AttentionBackend):
+
     accept_output_buffer: bool = True
 
     @staticmethod
@@ -25,12 +24,16 @@ class SageAttentionBackend(AttentionBackend):
         return [32, 64, 96, 128, 160, 192, 224, 256]
 
     @staticmethod
-    def get_enum() -> AttentionBackendEnum:
-        return AttentionBackendEnum.SAGE_ATTN
+    def get_name() -> str:
+        return "SAGE_ATTN"
 
     @staticmethod
     def get_impl_cls() -> type["SageAttentionImpl"]:
         return SageAttentionImpl
+
+    # @staticmethod
+    # def get_metadata_cls() -> Type["AttentionMetadata"]:
+    #     return FlashAttentionMetadata
 
 
 class SageAttentionImpl(AttentionImpl):
@@ -55,8 +58,6 @@ class SageAttentionImpl(AttentionImpl):
         key: torch.Tensor,
         value: torch.Tensor,
         attn_metadata: AttentionMetadata,
-        *,
-        return_softmax_lse: bool = False,
     ) -> torch.Tensor:
         output = sageattn(
             query,
@@ -65,10 +66,5 @@ class SageAttentionImpl(AttentionImpl):
             # since input is (batch_size, seq_len, head_num, head_dim)
             tensor_layout="NHD",
             is_causal=self.causal,
-            sm_scale=self.softmax_scale,
-            return_lse=return_softmax_lse,
         )
-        if return_softmax_lse:
-            output, softmax_lse = output
-            return output, softmax_lse
         return output

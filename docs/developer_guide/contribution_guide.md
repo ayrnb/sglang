@@ -78,19 +78,14 @@ For CI to run on a pull request, it must have the "run-ci" label. Authorized use
 - `/tag-run-ci-label`: Adds the "run-ci" label. Every future commit will trigger CI.
 - `/rerun-failed-ci`: Reruns the failed or flaky tests from the most recent commit.
 - `/tag-and-rerun-ci`: A single command that performs both `/tag-run-ci-label` and `/rerun-failed-ci`.
-- `/rerun-stage <stage-name>`: Reruns a specific test stage without waiting for its dependencies. This is useful when you want to quickly validate a fix for a specific test failure instead of waiting ~30 minutes for preceding stages to complete.
 
 If you have permission, the [Slash Command Handler](https://github.com/sgl-project/sglang/actions/workflows/slash-command-handler.yml) will run your command and react with a 👍 to your comment. It may take up to a few minutes for the reaction to appear. Here’s a usage [example](https://github.com/sgl-project/sglang/pull/14253#issuecomment-3599509302).
 
 To avoid spamming a PR with too many `/rerun-failed-ci` comments, you can also trigger the command by editing an existing comment and adding any suffix (e.g., `/rerun-failed-ci try again`).
 
-Example of rerunning a single test stage: `/rerun-stage unit-test-backend-4-gpu`.
-
 If you don’t have permission, please ask maintainers to trigger CI for you.
 
 ### CI rate limits
-
-Due to CI scheduling and limited resources, higher-priority PRs may preempt running jobs. In such cases, you may need to rerun the tests.
 
 We apply CI rate limits to prevent abuse and ensure fair usage of our CI resources.
 
@@ -140,6 +135,6 @@ Follow these steps:
 
 If you want to contribute but don’t have a specific idea in mind, pick issues labeled [“good first issue” or “help wanted”](https://github.com/sgl-project/sglang/issues?q=is%3Aissue+label%3A%22good+first+issue%22%2C%22help+wanted%22). These tasks typically have lower complexity and provide an excellent introduction to the codebase. Also check out this [code walk-through](https://github.com/zhaochenyang20/Awesome-ML-SYS-Tutorial/tree/main/sglang/code-walk-through) for a deeper look into SGLang’s workflow.
 
-If you have any questions or want to start a discussion, please feel free to ask in our [Slack channel](https://slack.sglang.io).
+If you have any questions or want to start a discussion, please feel free to ask in our [Slack channel](https://slack.sglang.ai).
 
 Thank you for your interest in SGLang. Happy coding!

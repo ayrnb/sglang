@@ -266,19 +266,15 @@ python -m sglang.launch_server \
 
 ### Usage
 
-Use ascend backend with [memfabric_hybrid](https://gitcode.com/Ascend/memfabric_hybrid) and ASCEND_MF_STORE_URL being set
+Use ascend backend with [mf_adapter(download link)](https://sglang-ascend.obs.cn-east-3.myhuaweicloud.com:443/sglang/mf_adapter-1.0.0-cp311-cp311-linux_aarch64.whl?AccessKeyId=HPUAXT4YM0U8JNTERLST&Expires=1783151861&Signature=3j10QDUjqk70enaq8lostYV2bEA%3D) and ASCEND_MF_STORE_URL being set
 
 ```bash
-pip install memfabric-hybrid==1.0.0
+pip install mf_adapter-1.0.0-cp311-cp311-linux_aarch64.whl --force-reinstall
 export ASCEND_MF_STORE_URL="tcp://xxx.xx.xxx.xxx:xxxx"
 ```
 Use mooncake backend, more details can be found in mooncake section.
 ```bash
 export ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE=true
-```
-ASCEND_NPU_PHY_ID need to be set in container env
-```bash
-export ASCEND_NPU_PHY_ID=xxx
 ```
 
 

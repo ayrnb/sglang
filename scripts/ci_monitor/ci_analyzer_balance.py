@@ -177,7 +177,6 @@ class SGLangTestBalanceAnalyzer:
             "stage-a-test-1",
             "unit-test-backend-1-gpu",
             "unit-test-backend-2-gpu",
-            "stage-b-test-4-gpu-b200",
             "unit-test-backend-4-gpu",
             "unit-test-backend-8-gpu-h200",
             "unit-test-backend-8-gpu-h20",

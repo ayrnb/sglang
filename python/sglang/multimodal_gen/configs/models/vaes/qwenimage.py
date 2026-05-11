@@ -20,7 +20,7 @@ class QwenImageVAEArchConfig(VAEArchConfig):
     dropout: float = 0.0
 
     is_residual: bool = False
-    input_channels: int = 3
+    in_channels: int = 3
     out_channels: int = 3
     patch_size: int | None = None
     scale_factor_temporal: int = 4

@@ -41,7 +41,6 @@ def torch_ref_rms_norm_rope(
     base,
     is_neox,
     position_ids,
-    partial_rotary_factor,
 ):
     """
     PyTorch reference implementation of RMSNorm+RoPE for verification.
@@ -61,7 +60,6 @@ def torch_ref_rms_norm_rope(
         base: Base value for RoPE calculations
         is_neox: Whether to use NeoX style RoPE
         position_ids: Position IDs for RoPE of shape [num_tokens]
-        partial_rotary_factor: Partial rotary factor
 
     Returns:
         Combined tensor with Q and K parts normalized and RoPE applied
@@ -93,7 +91,6 @@ def torch_ref_rms_norm_rope(
         is_neox_style=is_neox,
         rope_scaling=None,
         dual_chunk_attention_config=None,
-        partial_rotary_factor=partial_rotary_factor,
     )
     rotary_emb = rotary_emb.to(qkv.device)
 
@@ -130,12 +127,10 @@ num_heads_groups = [
     (32, 8, 8),  # Qwen3-4B, Qwen3-8B, Qwen3-30B-A3B
     (40, 8, 8),  # Qwen3-14B
     (64, 8, 8),  # Qwen3-32B, Qwen3-235B-A22B
-    (12, 1, 1),  # GLM4.6 TP8
 ]
 num_tokens_list = [1, 3, 8, 32, 256]
 is_neox_list = [False, True]
 dtypes = [torch.bfloat16]
-partial_rotary_factor_list = [1.0, 0.5]
 
 
 @pytest.mark.skipif(not _is_cuda, reason="Skipping CUDA/ROCm only tests.")
@@ -144,10 +139,7 @@ partial_rotary_factor_list = [1.0, 0.5]
 @pytest.mark.parametrize("num_tokens", num_tokens_list)
 @pytest.mark.parametrize("is_neox", is_neox_list)
 @pytest.mark.parametrize("dtype", dtypes)
-@pytest.mark.parametrize("partial_rotary_factor", partial_rotary_factor_list)
-def test_fused_qk_norm_rope(
-    head_dim, num_heads_group, num_tokens, is_neox, dtype, partial_rotary_factor
-):
+def test_fused_qk_norm_rope(head_dim, num_heads_group, num_tokens, is_neox, dtype):
     """
     Test the fused QK RMSNorm + RoPE operation with various configurations.
 
@@ -206,7 +198,6 @@ def test_fused_qk_norm_rope(
         low,
         high,
         attention_factor,
-        int(head_dim * partial_rotary_factor),
     )
     output = qkv  # This op is inplace
 
@@ -223,7 +214,6 @@ def test_fused_qk_norm_rope(
         base,
         is_neox,
         position_ids,
-        partial_rotary_factor,
     )
 
     # Compare outputs from custom kernel vs reference implementation

@@ -384,7 +384,6 @@ class Llama4DecoderLayer(nn.Module):
         self.config = config
         is_moe_layer = self._is_moe_layer(layer_id)
         is_previous_moe_layer = self._is_moe_layer(layer_id - 1)
-        is_next_moe_layer = self._is_moe_layer(layer_id + 1)
 
         if is_moe_layer:
             self.feed_forward = Llama4MoE(
@@ -411,7 +410,6 @@ class Llama4DecoderLayer(nn.Module):
             num_layers=config.num_hidden_layers,
             is_layer_sparse=is_moe_layer,
             is_previous_layer_sparse=is_previous_moe_layer,
-            is_next_layer_sparse=is_next_moe_layer,
         )
 
         self.layer_communicator = LayerCommunicator(

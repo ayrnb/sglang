@@ -19,10 +19,8 @@ class _ModelRegistry:
     # Keyed by model_arch
     models: Dict[str, Union[Type[nn.Module], str]] = field(default_factory=dict)
 
-    def register(
-        self, package_name: str, overwrite: bool = False, strict: bool = False
-    ):
-        new_models = import_model_classes(package_name, strict=strict)
+    def register(self, package_name: str, overwrite: bool = False):
+        new_models = import_model_classes(package_name)
         if overwrite:
             self.models.update(new_models)
         else:
@@ -90,7 +88,7 @@ class _ModelRegistry:
 
 
 @lru_cache()
-def import_model_classes(package_name: str, strict: bool = False):
+def import_model_classes(package_name: str):
     model_arch_name_to_cls = {}
     package = importlib.import_module(package_name)
     for _, name, ispkg in pkgutil.iter_modules(package.__path__, package_name + "."):
@@ -102,8 +100,6 @@ def import_model_classes(package_name: str, strict: bool = False):
             try:
                 module = importlib.import_module(name)
             except Exception as e:
-                if strict:
-                    raise
                 logger.warning(f"Ignore import error when loading {name}: {e}")
                 continue
             if hasattr(module, "EntryClass"):
@@ -128,5 +124,5 @@ def import_model_classes(package_name: str, strict: bool = False):
 ModelRegistry = _ModelRegistry()
 ModelRegistry.register("sglang.srt.models")
 
-if external_pkg := envs.SGLANG_EXTERNAL_MODEL_PACKAGE.get():
-    ModelRegistry.register(external_pkg, overwrite=True)
+if envs.SGLANG_EXTERNAL_MODEL_PACKAGE.value:
+    ModelRegistry.register(envs.SGLANG_EXTERNAL_MODEL_PACKAGE.value, overwrite=True)

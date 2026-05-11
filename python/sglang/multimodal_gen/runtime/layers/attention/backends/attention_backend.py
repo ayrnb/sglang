@@ -12,8 +12,6 @@ if TYPE_CHECKING:
 
 import torch
 
-from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
-
 
 class AttentionBackend(ABC):
     """Abstract class for attention backends."""
@@ -25,7 +23,7 @@ class AttentionBackend(ABC):
 
     @staticmethod
     @abstractmethod
-    def get_enum() -> AttentionBackendEnum:
+    def get_name() -> str:
         raise NotImplementedError
 
     @staticmethod

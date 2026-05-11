@@ -68,17 +68,14 @@ class WanImageToVideoDmdPipeline(LoRAPipeline, ComposedPipelineBase):
                 tokenizers=[self.get_module("tokenizer")],
             ),
         )
-        if (
-            self.get_module("image_encoder") is not None
-            and self.get_module("image_processor") is not None
-        ):
-            self.add_stage(
-                stage_name="image_encoding_stage",
-                stage=ImageEncodingStage(
-                    image_encoder=self.get_module("image_encoder"),
-                    image_processor=self.get_module("image_processor"),
-                ),
-            )
+
+        self.add_stage(
+            stage_name="image_encoding_stage",
+            stage=ImageEncodingStage(
+                image_encoder=self.get_module("image_encoder"),
+                image_processor=self.get_module("image_processor"),
+            ),
+        )
 
         self.add_stage(stage_name="conditioning_stage", stage=ConditioningStage())
 
@@ -105,7 +102,6 @@ class WanImageToVideoDmdPipeline(LoRAPipeline, ComposedPipelineBase):
             stage=DmdDenoisingStage(
                 transformer=self.get_module("transformer"),
                 scheduler=self.get_module("scheduler"),
-                transformer_2=self.get_module("transformer_2"),
             ),
         )
 

@@ -6,6 +6,7 @@ import torch
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
+from sglang.srt.custom_op import CustomOp
 from sglang.srt.layers.amx_utils import _amx_process_weight_after_loading
 from sglang.srt.layers.moe import (
     MoeRunner,
@@ -19,7 +20,6 @@ from sglang.srt.layers.quantization.base_config import (
     LinearMethodBase,
     QuantizeMethodBase,
 )
-from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -68,13 +68,12 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
     ):
         """Create weights for embedding layer."""
         if extra_weight_attrs.get("host_tensor", False):
-            from over_encoding_ops_kernel import custom_empty
-
+            from prc_custom_ops_kernel import custom_empty
             weight = Parameter(
                 custom_empty(
                     (sum(output_partition_sizes), input_size_per_partition),
                     dtype=params_dtype,
-                    device_id=torch.cuda.current_device(),
+                    device_id=torch.cuda.current_device()
                 ),
                 requires_grad=False,
             )
@@ -155,18 +154,14 @@ class UnquantizedLinearMethod(LinearMethodBase):
         return F.linear(x, layer.weight, bias)
 
 
-class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
+class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
     """MoE method without quantization."""
 
-    def __init__(
-        self, use_triton_kernels: bool = False, use_flashinfer_trtllm_moe: bool = False
-    ):
+    def __init__(self, use_triton_kernels: bool = False):
         super().__init__()
         self.use_flashinfer_cutlass = get_moe_runner_backend().is_flashinfer_cutlass()
         self.use_triton_kernels = use_triton_kernels
         self.with_bias = False
-        self.use_flashinfer_trtllm_moe = use_flashinfer_trtllm_moe
-        self._cache_permute_indices = dict({})
 
     def create_weights(
         self,
@@ -242,71 +237,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         # Pack weight for get better performance on CPU
         if _is_cpu and _is_cpu_amx_available:
             _amx_process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
-
-        # Reorder rows of W1 for fused gated activation
-        if self.use_flashinfer_trtllm_moe:
-            from flashinfer.fused_moe.core import (
-                _maybe_get_cached_w3_w1_permute_indices,
-                convert_to_block_layout,
-                get_w2_permute_indices_with_cache,
-            )
-
-            # w1 and w3 have been swapped, so we don't need do that here
-            epilogue_tile_m = 128
-            block_k = 128
-            old_shape_w13 = layer.w13_weight.data[0].shape
-            old_shape_w2 = layer.w2_weight.data[0].shape
-            new_shape_w13 = None
-            new_shape_w2 = None
-            for i in range(layer.num_local_experts):
-                permute_indices = _maybe_get_cached_w3_w1_permute_indices(
-                    self._cache_permute_indices,
-                    layer.w13_weight.data[i].view(torch.uint8),
-                    epilogue_tile_m,
-                )
-                tmp_weights1 = (
-                    layer.w13_weight.data[i]
-                    .clone()
-                    .view(torch.uint8)[permute_indices.to(layer.w13_weight.data.device)]
-                    .contiguous()
-                )
-
-                permute_indices = get_w2_permute_indices_with_cache(
-                    self._cache_permute_indices,
-                    layer.w2_weight.data[i].view(torch.uint8),
-                    epilogue_tile_m,
-                )
-                tmp_weights2 = (
-                    layer.w2_weight.data[i]
-                    .clone()
-                    .view(torch.uint8)[permute_indices.to(layer.w2_weight.data.device)]
-                    .contiguous()
-                )
-
-                tmp_weights1 = convert_to_block_layout(
-                    tmp_weights1.view(torch.uint8), block_k
-                )
-                tmp_weights2 = convert_to_block_layout(
-                    tmp_weights2.view(torch.uint8), block_k
-                )
-
-                new_shape_w13 = tmp_weights1.view(torch.bfloat16).shape
-                new_shape_w2 = tmp_weights2.view(torch.bfloat16).shape
-                layer.w13_weight.data[i] = (
-                    tmp_weights1.view(torch.bfloat16)
-                    .contiguous()
-                    .reshape(old_shape_w13)
-                )
-                layer.w2_weight.data[i] = (
-                    tmp_weights2.view(torch.bfloat16).contiguous().reshape(old_shape_w2)
-                )
-
-            layer.w13_weight.data = layer.w13_weight.data.reshape(
-                layer.num_local_experts, *new_shape_w13
-            )
-            layer.w2_weight.data = layer.w2_weight.data.reshape(
-                layer.num_local_experts, *new_shape_w2
-            )
 
         return
 

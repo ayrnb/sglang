@@ -13,8 +13,6 @@ from torch.nn.attention.flex_attention import (
     flex_attention,
 )
 
-from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
-
 # wan 1.3B model has a weird channel / head configurations and require max-autotune to work with flexattention
 # see https://github.com/pytorch/pytorch/issues/133254
 # change to default for other models
@@ -89,7 +87,6 @@ class CausalWanSelfAttention(nn.Module):
             causal=False,
             supported_attention_backends=(
                 AttentionBackendEnum.FA,
-                AttentionBackendEnum.AITER,
                 AttentionBackendEnum.TORCH_SDPA,
             ),
         )
@@ -423,7 +420,7 @@ class CausalWanTransformerBlock(nn.Module):
         return hidden_states
 
 
-class CausalWanTransformer3DModel(BaseDiT, OffloadableDiTMixin):
+class CausalWanTransformer3DModel(BaseDiT):
     _fsdp_shard_conditions = WanVideoConfig()._fsdp_shard_conditions
     _compile_conditions = WanVideoConfig()._compile_conditions
     _supported_attention_backends = WanVideoConfig()._supported_attention_backends
@@ -506,10 +503,6 @@ class CausalWanTransformer3DModel(BaseDiT, OffloadableDiTMixin):
         self.independent_first_frame = False
 
         self.__post_init__()
-
-        self.layer_names = [
-            "blocks",
-        ]
 
     @staticmethod
     def _prepare_blockwise_causal_attn_mask(

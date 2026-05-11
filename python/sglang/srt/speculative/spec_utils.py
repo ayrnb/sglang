@@ -4,8 +4,9 @@ import logging
 import os
 import time
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, List
 
+import prc_custom_ops
 import torch
 import triton
 import triton.language as tl
@@ -19,9 +20,11 @@ from sglang.srt.distributed.parallel_state import (
 from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import Req
-from sglang.srt.mem_cache.common import get_last_loc
-from sglang.srt.server_args import ServerArgs, get_global_server_args
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.utils import is_cuda, is_hip, is_npu, next_power_of_2
+from sglang.srt.utils.over_encoding_utils import (
+    assign_ngram_input_ids_draft_decode_first_token,
+)
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
@@ -48,14 +51,6 @@ SIMULATE_ACC_METHOD = envs.SGLANG_SIMULATE_ACC_METHOD.get()
 
 TREE_TRAVERSE_TIME_THRESHOLD = 1  # TODO: set this properly
 TREE_SPEC_KERNEL_AVAILABLE = _is_cuda  # This kernel is only available for CUDA now
-
-
-def spec_need_hidden_states(server_args: Optional[ServerArgs] = None) -> bool:
-    if server_args is None:
-        server_args = get_global_server_args()
-
-    # TODO(lsyin): also skip when 1) step = 1 or 2) standalone draft model
-    return not server_args.enable_multi_layer_eagle
 
 
 @triton.jit
@@ -475,14 +470,13 @@ def select_top_k_tokens(
     if i == 0:
         # The first step after extend
         input_ids = topk_index.flatten()
-        if hidden_states is not None:
-            hidden_states = hidden_states.repeat_interleave(topk, dim=0)
+        hidden_states = hidden_states.repeat_interleave(topk, dim=0)
         scores = topk_p  # shape: (b, topk)
 
         tree_info = (
             topk_p.unsqueeze(1),  # shape: (b, 1, topk)
             topk_index,  # shape: (b, topk)
-            torch.arange(-1, topk, dtype=torch.long, device=input_ids.device)
+            torch.arange(-1, topk, dtype=torch.long, device=hidden_states.device)
             .unsqueeze(0)
             .repeat(topk_p.shape[0], 1),  # shape: (b, topk + 1)
         )
@@ -512,6 +506,50 @@ def select_top_k_tokens(
         )
 
     return input_ids, hidden_states, scores, tree_info
+
+
+# @torch.compile(dynamic=True, disable=_is_npu)
+def select_top_k_tokens_ngram(
+    i: int,
+    forward_batch: ForwardBatch,
+    topk_index: torch.Tensor,
+    topk: int,
+    token_list: List[torch.Tensor],
+    parents_list: List[torch.Tensor],
+):
+    n_gram_input_ids = forward_batch.n_gram_input_ids
+    if n_gram_input_ids is None:
+        return
+
+    seq_lens = forward_batch.seq_lens
+    n_gram_tensors = n_gram_input_ids.input_ids_grams
+    if i == 0:
+        for idx, gram_tensor in enumerate(n_gram_tensors):
+            n = idx + 2
+            assign_ngram_input_ids_draft_decode_first_token(
+                n_gram_input_ids.input_ids_buffer,
+                gram_tensor,
+                seq_lens,
+                n,
+                topk,
+                n_gram_input_ids.buffer_size,
+            )
+    else:
+        parent_tensor = torch.cat(parents_list, dim=1)
+        token_tensor = torch.cat(token_list, dim=1)
+        for idx, gram_tensor in enumerate(n_gram_tensors):
+            n = idx + 2
+            prc_custom_ops.build_ngram_with_tree(
+                gram_tensor,
+                parent_tensor,
+                token_tensor,
+                parents_list[-1],
+                n_gram_input_ids.input_ids_buffer,
+                n_gram_input_ids.buffer_size,
+                n,
+                topk,
+                i,
+            )
 
 
 def generate_simulated_accept_index(
@@ -706,39 +744,3 @@ def detect_nan(logits_output: LogitsProcessorOutput):
     if torch.any(torch.isnan(logits)):
         logger.error("Detected errors during sampling! NaN in the logits.")
         raise ValueError("Detected errors during sampling! NaN in the logits.")
-
-
-# Disable torch.compile for this function because it will be
-# even slower.
-# @torch.compile(dynamic=True)
-def get_last_loc_large_page_size_large_top_k(
-    req_to_token: torch.Tensor,
-    req_pool_indices: torch.Tensor,
-    seq_lens: torch.Tensor,
-    speculative_num_steps: int,
-    topk: int,
-    page_size: int,
-):
-    prefix_lens = seq_lens
-    last_page_lens = prefix_lens % page_size
-    num_new_pages_per_topk = (
-        last_page_lens + speculative_num_steps + page_size - 1
-    ) // page_size
-    seq_lens = prefix_lens // page_size * page_size + num_new_pages_per_topk * (
-        page_size * topk
-    )
-    extend_lens = seq_lens - prefix_lens
-    last_loc = get_last_loc(
-        req_to_token,
-        req_pool_indices,
-        prefix_lens,
-    )
-
-    return (
-        prefix_lens,
-        seq_lens,
-        last_loc,
-        num_new_pages_per_topk,
-        extend_lens,
-        last_page_lens,
-    )

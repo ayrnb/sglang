@@ -1,13 +1,12 @@
 """
-This generates gpu kernel analysis output from nsys rep. Will call nsys
-stats  -r cuda_gpu_kern_trace, get non-overlapped gpu cycles, then generate
-csv and html output for analysis
+    This generates gpu kernel analysis output from nsys rep. Will call nsys
+    stats  -r cuda_gpu_kern_trace, get non-overlapped gpu cycles, then generate
+    csv and html output for analysis
 """
 
 import argparse
 import logging
 import os
-import shlex
 
 import regex as re
 
@@ -224,7 +223,7 @@ class GPUTrace2Graph:
                 "-o",
                 f"{file_dir}/{file_name}",
             ]
-            cmd_str = shlex.join(cmd)
+            cmd_str = " ".join(cmd)
             logger.info("+ %s", cmd_str)
             # estimate time based on calibrated 240M/min
             file_size_mb = os.path.getsize(file) / 1e6

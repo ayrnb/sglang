@@ -166,12 +166,6 @@ class XGrammarGrammar(BaseGrammarObject):
         return f"XGrammarGrammar({self.key_string=}, {self.accepted_tokens=}, {self.current_token=})"
 
 
-class TokenizerNotSupportedError(Exception):
-    """Raised when tokenizer is not supported by XGrammar backend."""
-
-    pass
-
-
 class XGrammarGrammarBackend(BaseGrammarBackend):
     def __init__(
         self,
@@ -188,21 +182,14 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
 
             if tokenizer_info is None:
                 # Not supported tokenizer
-                raise TokenizerNotSupportedError(
-                    f"Tokenizer type {type(tokenizer).__name__} is not supported by XGrammar"
-                )
+                return
         else:
             # Create TokenizerInfo with model's EOS tokens as the authoritative stop tokens
             # This ensures consistency between what the model considers EOS and what XGrammar uses
-            try:
-                tokenizer_info = TokenizerInfo.from_huggingface(
-                    tokenizer, vocab_size=vocab_size, stop_token_ids=model_eos_token_ids
-                )
-                override_stop_tokens = None
-            except Exception as e:
-                raise TokenizerNotSupportedError(
-                    f"Failed to create XGrammar TokenizerInfo from tokenizer: {e}"
-                )
+            tokenizer_info = TokenizerInfo.from_huggingface(
+                tokenizer, vocab_size=vocab_size, stop_token_ids=model_eos_token_ids
+            )
+            override_stop_tokens = None
 
         self.grammar_compiler = GrammarCompiler(tokenizer_info=tokenizer_info)
         self.vocab_size = vocab_size

@@ -2,20 +2,16 @@ from __future__ import annotations
 
 """Cache for chunked prefill, used when RadixCache is disabled."""
 
-import logging
 from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
+from sglang.srt.mem_cache.allocator import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchResult
-from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-
-
-logger = logging.getLogger(__name__)
 
 
 class ChunkCache(BasePrefixCache):
@@ -23,6 +19,9 @@ class ChunkCache(BasePrefixCache):
         self.req_to_token_pool = params.req_to_token_pool
         self.token_to_kv_pool_allocator = params.token_to_kv_pool_allocator
         self.page_size = params.page_size
+        # Each logical token maps to scale_seq_factor physical KV slots.
+        # Overridden by scheduler after init via tree_cache.scale_seq_factor = N.
+        self.scale_seq_factor = 1
         if self.token_to_kv_pool_allocator:
             self.device = self.token_to_kv_pool_allocator.device
         else:
@@ -48,18 +47,24 @@ class ChunkCache(BasePrefixCache):
         )
 
     def cache_finished_req(self, req: Req, is_insert: bool = True):
-        kv_committed_len = req.pop_committed_kv_cache()
+        """Free all KV cache for a finished request (no prefix sharing)."""
+        scale = self.scale_seq_factor
+        kv_committed_len = req.pop_committed_kv_cache() * scale
         # For decode server: if req.output_ids is empty, we want to free all req.origin_input_ids
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, :kv_committed_len
         ]
         self.req_to_token_pool.free(req.req_pool_idx)
         self.token_to_kv_pool_allocator.free(kv_indices)
+        self.protected_size_ -= len(req.prefix_indices)
 
     def cache_unfinished_req(self, req: Req, chunked=False):
+        scale = self.scale_seq_factor
         kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, : len(req.fill_ids)
+            req.req_pool_idx, : len(req.fill_ids) * scale
         ]
+        self.protected_size_ += len(kv_indices) - len(req.prefix_indices)
+
         # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
         req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
 
@@ -73,8 +78,7 @@ class ChunkCache(BasePrefixCache):
         return 0
 
     def protected_size(self):
-        # NOTE: no protected size in chunk cache. Chunk cache's eviction is the same with request's lifecycle.
-        return 0
+        return self.protected_size_
 
     def pretty_print(self):
         return ""
@@ -87,48 +91,16 @@ class SWAChunkCache(ChunkCache):
         assert isinstance(params.token_to_kv_pool_allocator, SWATokenToKVPoolAllocator)
         super().__init__(params)
 
-        assert (
-            params.sliding_window_size is not None
-            or params.attention_chunk_size is not None
-        ), "Sliding window size or attention chunk size must be set for SWAChunkCache"
-
-        if (
-            params.sliding_window_size is not None
-            and params.attention_chunk_size is not None
-        ):
-            logger.warning(
-                "Sliding window size and attention chunk size are both set, use sliding window size for chunk cache eviction."
-            )
-
-        self.sliding_window_size = params.sliding_window_size
-        self.attention_chunk_size = params.attention_chunk_size
-        self.window_size = self.sliding_window_size or self.attention_chunk_size
-
-        self.chunked_prefill_size = params.chunked_prefill_size
-
     def evict_swa(
         self,
         req: Req,
         prelen: int,
+        attention_chunk_size: int,
     ):
-        if self.sliding_window_size is not None:
-            # Sliding window attention (e.g. mimo-v2-flash, gpt-oss)
-            new_evicted_seqlen_local = max(
-                req.evicted_seqlen_local, prelen - self.sliding_window_size
+        if prelen >= req.evicted_seqlen_local + attention_chunk_size:
+            new_evicted_seqlen_local = attention_chunk_size * (
+                prelen // attention_chunk_size
             )
-        elif self.attention_chunk_size is not None:
-            # Local attention (e.g. llama4)
-            new_evicted_seqlen_local = max(
-                req.evicted_seqlen_local,
-                prelen // self.attention_chunk_size * self.attention_chunk_size,
-            )
-
-        if self.page_size > 1:
-            new_evicted_seqlen_local = (
-                new_evicted_seqlen_local // self.page_size
-            ) * self.page_size
-
-        if new_evicted_seqlen_local > req.evicted_seqlen_local:
             free_slots = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, req.evicted_seqlen_local : new_evicted_seqlen_local
             ]

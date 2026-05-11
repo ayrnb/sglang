@@ -17,7 +17,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
-from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs, get_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
@@ -96,18 +95,6 @@ class PipelineStage(ABC):
     def maybe_free_model_hooks(self):
         pass
 
-    def load_model(self):
-        """
-        Load the model for the stage.
-        """
-        pass
-
-    def offload_model(self):
-        """
-        Offload the model for the stage.
-        """
-        pass
-
     # execute on all ranks by default
     @property
     def parallelism_type(self) -> StageParallelismType:
@@ -160,9 +147,7 @@ class PipelineStage(ABC):
     @property
     def device(self) -> torch.device:
         """Get the device for this stage."""
-        return torch.device(
-            current_platform.device_type,
-        )
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     def set_logging(self, enable: bool):
         """
@@ -191,32 +176,31 @@ class PipelineStage(ABC):
         """
         stage_name = self.__class__.__name__
         # Check if verification is enabled (simple approach for prototype)
+        enable_verification = getattr(server_args, "enable_stage_verification", False)
 
-        # Pre-execution input verification
-        try:
-            input_result = self.verify_input(batch, server_args)
-            self._run_verification(input_result, stage_name, "input")
-        except Exception as e:
-            logger.error("Input verification failed for %s: %s", stage_name, str(e))
-            raise
+        if enable_verification:
+            # Pre-execution input verification
+            try:
+                input_result = self.verify_input(batch, server_args)
+                self._run_verification(input_result, stage_name, "input")
+            except Exception as e:
+                logger.error("Input verification failed for %s: %s", stage_name, str(e))
+                raise
 
         # Execute the actual stage logic with unified profiling
-        with StageProfiler(
-            stage_name,
-            logger=logger,
-            timings=batch.timings,
-            perf_dump_path_provided=batch.perf_dump_path is not None,
-            log_stage_start_end=not batch.is_warmup,
-        ):
+        with StageProfiler(stage_name, logger=logger, timings=batch.timings):
             result = self.forward(batch, server_args)
 
-        # Post-execution output verification
-        try:
-            output_result = self.verify_output(result, server_args)
-            self._run_verification(output_result, stage_name, "output")
-        except Exception as e:
-            logger.error("Output verification failed for %s: %s", stage_name, str(e))
-            raise
+        if enable_verification:
+            # Post-execution output verification
+            try:
+                output_result = self.verify_output(result, server_args)
+                self._run_verification(output_result, stage_name, "output")
+            except Exception as e:
+                logger.error(
+                    "Output verification failed for %s: %s", stage_name, str(e)
+                )
+                raise
 
         return result
 

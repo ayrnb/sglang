@@ -21,7 +21,6 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
     AttentionMetadata,
     AttentionMetadataBuilder,
 )
-from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -132,8 +131,8 @@ class VideoSparseAttentionBackend(AttentionBackend):
         return [64, 128]
 
     @staticmethod
-    def get_enum() -> AttentionBackendEnum:
-        return AttentionBackendEnum.VIDEO_SPARSE_ATTN
+    def get_name() -> str:
+        return "VIDEO_SPARSE_ATTN"
 
     @staticmethod
     def get_impl_cls() -> type["VideoSparseAttentionImpl"]:

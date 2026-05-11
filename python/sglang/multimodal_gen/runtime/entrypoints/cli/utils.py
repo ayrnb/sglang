@@ -4,7 +4,6 @@
 
 import argparse
 import os
-import shlex
 import subprocess
 import sys
 
@@ -54,7 +53,7 @@ def launch_distributed(
     cmd.extend(args)
 
     logger.info("Running inference with %d GPU(s)", num_gpus)
-    logger.info("Launching command: %s", shlex.join(cmd))
+    logger.info("Launching command: %s", " ".join(cmd))
 
     current_env["PYTHONIOENCODING"] = "utf-8"
     process = subprocess.Popen(

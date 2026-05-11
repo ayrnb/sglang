@@ -6,18 +6,7 @@ from typing import List, Optional, Tuple
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_extend_npu_graph_runner import (
-    EAGLEDraftExtendNpuGraphRunner,
-)
-from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_npu_graph_runner import (
-    EAGLEDraftNpuGraphRunner,
-)
-from sglang.srt.layers.attention.triton_backend import TritonMultiStepDraftBackend
-from sglang.srt.layers.dp_attention import get_attention_tp_group
-from sglang.srt.layers.moe.utils import (
-    speculative_moe_a2a_backend_context,
-    speculative_moe_backend_context,
-)
+from sglang.srt.layers.moe.utils import speculative_moe_backend_context
 from sglang.srt.managers.io_struct import UpdateWeightsFromTensorReqInput
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
@@ -32,11 +21,16 @@ from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
 from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import (
     EAGLEDraftExtendCudaGraphRunner,
 )
+from sglang.srt.speculative.eagle_draft_extend_npu_graph_runner import (
+    EAGLEDraftExtendNpuGraphRunner,
+)
+from sglang.srt.speculative.eagle_draft_npu_graph_runner import EAGLEDraftNpuGraphRunner
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.eagle_info_v2 import (
     assign_extend_cache_locs,
     fill_accepted_out_cache_loc,
     fill_new_verified_id,
+    select_top_k_tokens_tmp,
 )
 from sglang.srt.speculative.eagle_utils import TreeMaskMode, build_tree_kernel_efficient
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -45,21 +39,18 @@ from sglang.srt.speculative.spec_utils import (
     draft_tp_context,
     generate_token_bitmask,
     load_token_map,
-    select_top_k_tokens,
 )
 from sglang.srt.utils.common import (
     MultiprocessingSerializer,
     empty_context,
     fast_topk,
     get_available_gpu_memory,
-    is_cuda,
     is_npu,
     next_power_of_2,
 )
 from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
 
 _is_npu = is_npu()
-_is_cuda = is_cuda()
 
 logger = logging.getLogger(__name__)
 
@@ -119,15 +110,7 @@ class EagleDraftWorker(BaseDraftWorker):
         self.req_to_token_pool, self.token_to_kv_pool_allocator = (
             target_worker.get_memory_pool()
         )
-
-        # Init draft worker
-        if server_args.enable_dp_attention and self.speculative_algorithm.is_eagle3():
-            ctx = draft_tp_context(get_attention_tp_group())
-        else:
-            ctx = empty_context()
-        with (
-            ctx
-        ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+        with empty_context(), speculative_moe_backend_context():
             # Init draft worker
             self.draft_worker = TpModelWorker(
                 server_args=server_args,
@@ -144,14 +127,7 @@ class EagleDraftWorker(BaseDraftWorker):
 
         # Alias for better readability
         self.draft_runner = self.draft_worker.model_runner
-        self.eagle_use_aux_hidden_state = False
-        if self.speculative_algorithm.is_eagle3():
-            eagle_config = getattr(
-                self.draft_runner.model_config.hf_config, "eagle_config", {}
-            )
-            self.eagle_use_aux_hidden_state = eagle_config.get(
-                "use_aux_hidden_state", True
-            )
+
         self.init_token_map()
         self.init_lm_head()
 
@@ -162,7 +138,7 @@ class EagleDraftWorker(BaseDraftWorker):
         )
         with self.draft_tp_context(
             self.draft_runner.tp_group
-        ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+        ), speculative_moe_backend_context():
             self.init_attention_backend()
             self.init_cuda_graphs()
 
@@ -270,14 +246,8 @@ class EagleDraftWorker(BaseDraftWorker):
             "cuda": EAGLEDraftExtendCudaGraphRunner,
         }
         # Capture extend
-        # TODO: support draft extend cuda graph for more attention backends
-        if self.draft_extend_attn_backend and (
-            _is_npu
-            or (
-                _is_cuda
-                and isinstance(self.draft_attn_backend, TritonMultiStepDraftBackend)
-            )
-        ):
+        # FIXME cuda not support draft_extend capture
+        if self.draft_extend_attn_backend and _is_npu:
             tic = time.perf_counter()
             before_mem = get_available_gpu_memory(self.device, self.gpu_id)
             logger.info(
@@ -397,7 +367,7 @@ class EagleDraftWorker(BaseDraftWorker):
         # Forward multiple steps
         scores = None
         for i in range(self.speculative_num_steps):
-            input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
+            input_ids, hidden_states, scores, tree_info = select_top_k_tokens_tmp(
                 i, topk_p, topk_index, hidden_states, scores, self.topk
             )
             score_list.append(tree_info[0])
@@ -416,9 +386,9 @@ class EagleDraftWorker(BaseDraftWorker):
             spec_info.hidden_states = hidden_states
 
             # Run forward
-            logits_output = self.draft_runner.forward(
+            logits_output, _ = self.draft_runner.forward(
                 forward_batch, skip_attn_backend_init=True
-            ).logits_output
+            )
             if self.server_args.enable_nan_detection:
                 detect_nan(logits_output)
             probs = torch.softmax(logits_output.next_token_logits, dim=-1)
@@ -490,7 +460,7 @@ class EagleDraftWorker(BaseDraftWorker):
 
         # Run forward
         forward_batch = ForwardBatch.init_new(batch, self.draft_runner)
-        logits_output = self.draft_runner.forward(forward_batch).logits_output
+        logits_output, _ = self.draft_runner.forward(forward_batch)
 
         # Update spec_info for the next draft step
         probs = torch.softmax(logits_output.next_token_logits, dim=-1)
@@ -507,7 +477,7 @@ class EagleDraftWorker(BaseDraftWorker):
         draft_input = EagleDraftInput(
             hidden_states=batch_result.logits_output.hidden_states,
             num_tokens_per_batch=self.speculative_num_steps + 1,
-            num_tokens_for_logprob_per_batch=self.speculative_num_steps + 1,
+            num_tokens_for_logprob_per_batch=1,
         )
         select_index = (
             torch.arange(len(batch.seq_lens), device=self.device)
@@ -531,9 +501,6 @@ class EagleDraftWorker(BaseDraftWorker):
                 self.plan_stream
             )
 
-        if forward_batch.spec_info.accept_length is None:
-            forward_batch.spec_info.accept_length = batch_result.accept_lens
-
         # Run draft extend batch in the main compute stream
         can_cuda_graph = (
             self.cuda_graph_runner_for_draft_extend
@@ -544,9 +511,9 @@ class EagleDraftWorker(BaseDraftWorker):
                 forward_batch
             )
         else:
-            draft_logits_output = self.draft_runner.forward(
+            draft_logits_output, _ = self.draft_runner.forward(
                 forward_batch, skip_attn_backend_init=True
-            ).logits_output
+            )
 
         # Reorganize the spec info for the next batch
         draft_logits_output.next_token_logits = draft_logits_output.next_token_logits[
@@ -642,17 +609,12 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
             # Draft prefill
             model_worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST
-            with self.draft_worker.draft_tp_context(
-                self.draft_worker.draft_runner.tp_group
-            ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
-                batch_output.next_draft_input = (
-                    self.draft_worker._draft_extend_for_prefill(
-                        model_worker_batch,
-                        batch_output.logits_output.hidden_states,
-                        batch_output.next_token_ids,
-                    )
-                )
-                return batch_output
+            batch_output.next_draft_input = self.draft_worker._draft_extend_for_prefill(
+                model_worker_batch,
+                batch_output.logits_output.hidden_states,
+                batch_output.next_token_ids,
+            )
+            return batch_output
         else:
             if model_worker_batch.spec_info is None:
                 model_worker_batch.spec_info = EagleDraftInput.create_idle_input(
@@ -662,21 +624,11 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     topk=self.topk,
                     capture_hidden_mode=CaptureHiddenMode.LAST,
                 )
-            with self.draft_worker.draft_tp_context(
-                self.draft_worker.draft_runner.tp_group
-            ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
-                verify_input: EagleVerifyInput = self.draft_worker.draft(
-                    model_worker_batch
-                )
+            verify_input: EagleVerifyInput = self.draft_worker.draft(model_worker_batch)
             assert verify_input.is_verify_input()
             model_worker_batch.spec_info = verify_input
             batch_output = self.verify(model_worker_batch)
-            with self.draft_worker.draft_tp_context(
-                self.draft_worker.draft_runner.tp_group
-            ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
-                self.draft_worker._draft_extend_for_decode(
-                    model_worker_batch, batch_output
-                )
+            self.draft_worker._draft_extend_for_decode(model_worker_batch, batch_output)
             return batch_output
 
     def verify(self, batch: ModelWorkerBatch):
@@ -689,7 +641,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
         # Parse args
         verify_input: EagleVerifyInput = batch.spec_info
-        verify_input.num_tokens_per_batch = self.speculative_num_steps + 1
         bs = len(batch.seq_lens)
 
         # Batch 1: Target verify
